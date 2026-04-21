@@ -67,11 +67,11 @@ def extract_notes_from_midi(file_path: str | Path) -> list[note.Note]:
 
 if __name__ == "__main__":
     repo_root = Path(__file__).resolve().parents[3]
-    demo_path = repo_root / "data" / "raw" / "dummy.mid"
+    demo_path = repo_root / "data" / "raw" / "castle-complete.mid"
     try:
         extracted = extract_notes_from_midi(demo_path)
-        first_ten = [n.nameWithOctave for n in extracted[:10]]
+        notes = [n.nameWithOctave for n in extracted]
         print(f"Loaded {len(extracted)} notes from {demo_path}")
-        print("First 10 notes:", first_ten)
+        print("First 10 notes:", notes)
     except Exception as err:
         print(f"Demo failed for {demo_path}: {err}")
