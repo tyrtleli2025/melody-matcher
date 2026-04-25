@@ -1,0 +1,19 @@
+[project]
+name = "melody-matcher"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "tqdm>=4.0",
+    "requests>=2.28",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths  = ["tests"]
+log_cli    = false

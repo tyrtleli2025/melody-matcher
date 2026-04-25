@@ -136,6 +136,8 @@ celerybeat.pid
 
 # Environments
 .env
+.env.*
+!.env.example
 .envrc
 .venv
 env/
@@ -168,12 +170,8 @@ dmypy.json
 # Cython debug symbols
 cython_debug/
 
-# PyCharm
-#  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
-#  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore
-#  and can be added to the global gitignore or merged into this file.  For a more nuclear
-#  option (not recommended) you can uncomment the following to ignore the entire idea folder.
-#.idea/
+# PyCharm / JetBrains IDEs
+.idea/
 
 # Abstra
 # Abstra is an AI-powered process automation framework.
@@ -182,11 +180,7 @@ cython_debug/
 .abstra/
 
 # Visual Studio Code
-#  Visual Studio Code specific template is maintained in a separate VisualStudioCode.gitignore 
-#  that can be found at https://github.com/github/gitignore/blob/main/Global/VisualStudioCode.gitignore
-#  and can be added to the global gitignore or merged into this file. However, if you prefer, 
-#  you could uncomment the following to ignore the entire vscode folder
-# .vscode/
+.vscode/
 
 # Ruff stuff:
 .ruff_cache/
@@ -207,3 +201,81 @@ marimo/_lsp/
 __marimo__/
 
 .DS_Store
+Thumbs.db
+
+# =============================================================================
+# Melody Matcher — corpus data
+# =============================================================================
+
+# Raw MIDI corpora: lmd_matched (~45k files, ~1.5 GB) and lmd_full (~178k
+# files, ~3 GB) are downloaded once and live only on the local machine.
+data/v2/raw_midi/lmd_matched/
+data/v2/raw_midi/lmd_full/
+
+# MSD supplementary files: unique_tracks.txt is ~212 MB uncompressed;
+# track_metadata.db is ~1.9 GB. Both are re-downloadable from the MSD site.
+data/v2/raw_midi/unique_tracks.txt
+data/v2/raw_midi/track_metadata.db
+
+# Compressed archives left over after extraction (tarballs can be multi-GB)
+*.tar.gz
+*.tar.bz2
+*.zip
+
+# Any stray MIDI files outside the corpus tree. The small v1 fixture files
+# in data/raw/ are intentionally tracked for unit tests — keep them.
+*.mid
+*.midi
+!data/raw/**/*.mid
+!data/raw/**/*.midi
+
+# Eval query audio: MIR-QBSH and hand-recorded sets are re-downloadable and
+# must never be committed (eval sets are frozen; accidental training leakage
+# is a correctness risk).
+data/v2/eval/mir_qbsh/
+data/v2/eval/hand_recorded/
+
+# HuggingFace model cache (MERT-v1-95M, MidiBERT weights are several GB each)
+.cache/huggingface/
+
+# =============================================================================
+# Melody Matcher — ML artifacts
+# =============================================================================
+
+# FAISS indexes are rebuilt deterministically from the corpus; no reason to
+# version binary blobs that can be hundreds of MB.
+*.index
+data/v2/index/
+
+# PyTorch / ONNX / Safetensors model weights
+*.pth
+*.pt
+*.onnx
+*.safetensors
+*.bin
+
+# Experiment tracking runs
+wandb/
+mlruns/
+lightning_logs/
+
+# =============================================================================
+# Melody Matcher — processed data
+# =============================================================================
+
+# Checkpoint DB written by fetch_popularity.py — transient resume state,
+# not a source artifact.
+data/v2/processed/popularity_checkpoint.db
+
+# songs.parquet will exceed 100 MB once melody features are extracted for the
+# full 31k-song corpus; it is a derived artifact of the ingestion pipeline.
+data/v2/processed/songs.parquet
+
+# Any other large columnar files produced by future pipeline stages
+data/v2/processed/*.parquet
+data/v2/processed/*.arrow
+data/v2/processed/*.feather
+
+# Keep the small JSON manifests (lmd_manifest.json, popularity_scores.json).
+# These are < 10 MB, human-readable, and serve as the authoritative corpus index.
+!data/v2/processed/*.json
