@@ -6,6 +6,10 @@ dependencies = [
     "tqdm>=4.0",
     "requests>=2.28",
     "python-dotenv>=1.0",
+    "pretty_midi>=0.2.10",
+    "pandas>=2.0",
+    "fastdtw>=0.3.4",
+    "pyarrow>=14.0",
 ]
 
 [project.optional-dependencies]
