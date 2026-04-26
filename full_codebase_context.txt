@@ -1,0 +1,3620 @@
+"""MIDI reading utilities for melody extraction."""
+
+from __future__ import annotations
+
+from collections import defaultdict
+from pathlib import Path
+
+from music21 import chord, converter, note, stream
+
+
+def extract_notes_from_midi(file_path: str | Path) -> list[note.Note]:
+    """Parse a MIDI file and extract a simple melody note sequence.
+
+    This first-pass implementation handles polyphonic MIDI by using a top-line
+    heuristic: for each onset time, it keeps only the highest pitch. This tends
+    to approximate the primary melody in many common arrangements.
+
+    Rests are ignored.
+
+    Args:
+        file_path: Path to a ``.mid`` or ``.midi`` file.
+
+    Returns:
+        A list of ``music21.note.Note`` objects in chronological order.
+        Returns an empty list when no notes are found.
+
+    Raises:
+        FileNotFoundError: If the file does not exist.
+        ValueError: If the path is not a file, or music21 cannot parse it.
+    """
+    path = Path(file_path)
+    if not path.exists():
+        raise FileNotFoundError(f"MIDI file not found: {path}")
+    if not path.is_file():
+        raise ValueError(f"Expected a file path, got: {path}")
+
+    try:
+        parsed: stream.Score = converter.parse(str(path))
+    except Exception as exc:  # pragma: no cover - exact parse errors vary by file
+        raise ValueError(f"Failed to parse MIDI file: {path}") from exc
+
+    # Collect candidate notes keyed by absolute onset offset.
+    # For chords, keep only the top note from that chord (highest pitch).
+    notes_by_offset: dict[float, list[note.Note]] = defaultdict(list)
+
+    for element in parsed.recurse().notes:
+        try:
+            offset = float(element.getOffsetInHierarchy(parsed))
+        except Exception:
+            offset = float(element.offset)
+
+        if isinstance(element, note.Note):
+            notes_by_offset[offset].append(element)
+            continue
+
+        if isinstance(element, chord.Chord) and element.notes:
+            highest = max(element.notes, key=lambda n: n.pitch.midi)
+            notes_by_offset[offset].append(highest)
+
+    melody: list[note.Note] = []
+    for offset in sorted(notes_by_offset):
+        highest_at_onset = max(notes_by_offset[offset], key=lambda n: n.pitch.midi)
+        melody.append(highest_at_onset)
+
+    return melody
+
+
+if __name__ == "__main__":
+    repo_root = Path(__file__).resolve().parents[3]
+    demo_path = repo_root / "data" / "raw" / "castle-complete.mid"
+    try:
+        extracted = extract_notes_from_midi(demo_path)
+        notes = [n.nameWithOctave for n in extracted]
+        print(f"Loaded {len(extracted)} notes from {demo_path}")
+        print("First 10 notes:", notes)
+    except Exception as err:
+        print(f"Demo failed for {demo_path}: {err}")
+"""Utilities for converting note sequences into relative semitone intervals."""
+
+from __future__ import annotations
+
+from collections.abc import Sequence
+
+from music21 import interval, note, pitch
+
+
+def _to_music21_note(value: str | note.Note) -> note.Note:
+    """Convert a supported note representation into a ``music21.note.Note``.
+
+    Args:
+        value: A pitch string (for example ``"C4"``) or a ``music21.note.Note``.
+
+    Returns:
+        A ``music21.note.Note`` instance representing the same pitch.
+
+    Raises:
+        TypeError: If ``value`` is not a supported type.
+        ValueError: If ``value`` cannot be parsed into a valid musical note.
+    """
+    if isinstance(value, note.Note):
+        return value
+
+    if isinstance(value, str):
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("Empty note string is not valid.")
+        try:
+            parsed_pitch = pitch.Pitch(cleaned)
+        except Exception as exc:  # pragma: no cover - exact exception varies in music21
+            raise ValueError(f"Invalid note string: {value!r}") from exc
+        return note.Note(parsed_pitch)
+
+    raise TypeError(
+        "Unsupported note value type. Expected str or music21.note.Note, "
+        f"got {type(value).__name__}."
+    )
+
+
+def encode_intervals(notes: Sequence[str | note.Note]) -> list[int]:
+    """Encode a melody as semitone jumps between consecutive notes.
+
+    This function converts each consecutive note pair into a chromatic interval
+    measured in semitones (ascending intervals are positive, descending are
+    negative). The output is transposition-invariant and suitable for melody
+    matching.
+
+    Args:
+        notes: Ordered sequence of notes, where each item is either:
+            - a pitch string such as ``"C4"``, ``"F#3"``, ``"Bb5"``, or
+            - a ``music21.note.Note`` instance.
+
+    Returns:
+        A list of integer semitone differences between consecutive notes.
+        Example: ``["C4", "E4", "G4"] -> [4, 3]``.
+
+        If fewer than 2 notes are provided, returns an empty list.
+
+    Raises:
+        TypeError: If ``notes`` is not a sequence, or contains unsupported item types.
+        ValueError: If a note string is invalid.
+    """
+    if not isinstance(notes, Sequence):
+        raise TypeError(
+            f"'notes' must be a sequence of note values, got {type(notes).__name__}."
+        )
+
+    if len(notes) < 2:
+        return []
+
+    normalized_notes = [_to_music21_note(n) for n in notes]
+    semitone_steps: list[int] = []
+
+    for current_note, next_note in zip(normalized_notes, normalized_notes[1:]):
+        chromatic_interval = interval.Interval(current_note, next_note)
+        semitone_steps.append(int(chromatic_interval.chromatic.semitones))
+
+    return semitone_steps
+
+
+if __name__ == "__main__":
+    # Simple "Twinkle Twinkle Little Star" opening phrase:
+    # C C G G A A G
+    demo_notes = ["C4", "C4", "G4", "G4", "A4", "A4", "G4"]
+    print("Input notes:", demo_notes)
+    print(encode_intervals(demo_notes))"""Persistence layer for the melody interval inverted index."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Any
+
+# Schema:
+#   {
+#     "[2, 2, 1, 2]": [{"file": "song.mid", "segment_index": 0}, ...],
+#     ...
+#   }
+Index = dict[str, list[dict[str, Any]]]
+
+_DEFAULT_INDEX_DIR = Path(__file__).resolve().parents[4] / "data" / "index"
+_DEFAULT_INDEX_FILE = _DEFAULT_INDEX_DIR / "melody_index.json"
+
+
+def save_index(index: Index, path: str | Path = _DEFAULT_INDEX_FILE) -> Path:
+    """Serialize the inverted index to a JSON file.
+
+    The parent directory is created automatically if it does not exist.
+
+    Args:
+        index: The inverted index mapping stringified interval signatures to
+            a list of occurrence dicts (``{"file": ..., "segment_index": ...}``).
+        path: Destination file path. Defaults to ``data/index/melody_index.json``
+            relative to the repository root.
+
+    Returns:
+        The resolved ``Path`` of the written file.
+
+    Raises:
+        TypeError: If ``index`` is not a dict.
+        OSError: If the file cannot be written (permissions, disk full, etc.).
+    """
+    if not isinstance(index, dict):
+        raise TypeError(f"'index' must be a dict, got {type(index).__name__}.")
+
+    dest = Path(path).resolve()
+    dest.parent.mkdir(parents=True, exist_ok=True)
+
+    with dest.open("w", encoding="utf-8") as fh:
+        json.dump(index, fh, indent=2, ensure_ascii=False)
+
+    return dest
+
+
+def load_index(path: str | Path = _DEFAULT_INDEX_FILE) -> Index:
+    """Load the inverted index from a JSON file.
+
+    Args:
+        path: Source file path. Defaults to ``data/index/melody_index.json``
+            relative to the repository root.
+
+    Returns:
+        The deserialized inverted index dict. Returns an empty dict if the
+        file does not exist yet (first-run scenario).
+
+    Raises:
+        ValueError: If the file exists but cannot be parsed as valid JSON.
+        OSError: If the file exists but cannot be read.
+    """
+    src = Path(path).resolve()
+
+    if not src.exists():
+        return {}
+
+    try:
+        with src.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Index file contains invalid JSON: {src}") from exc
+
+    return data
+"""Exact and fuzzy search over the melody inverted index."""
+
+from __future__ import annotations
+
+from typing import Any
+
+from melody_matcher.features.interval_encoder import encode_intervals
+from melody_matcher.preprocessing.segmenter import create_segments
+
+Index = dict[str, list[dict[str, Any]]]
+
+# A result dict always has these keys plus an added "score" (0.0–1.0).
+SearchResult = dict[str, Any]
+
+
+# ---------------------------------------------------------------------------
+# Similarity
+# ---------------------------------------------------------------------------
+
+def _levenshtein(a: list[int], b: list[int]) -> int:
+    """Standard dynamic-programming Levenshtein distance on integer sequences."""
+    la, lb = len(a), len(b)
+    if la == 0:
+        return lb
+    if lb == 0:
+        return la
+
+    # Two-row rolling array — O(min(la,lb)) space.
+    if la < lb:
+        a, b, la, lb = b, a, lb, la
+
+    prev = list(range(lb + 1))
+    for i in range(1, la + 1):
+        curr = [i] + [0] * lb
+        for j in range(1, lb + 1):
+            cost = 0 if a[i - 1] == b[j - 1] else 1
+            curr[j] = min(curr[j - 1] + 1, prev[j] + 1, prev[j - 1] + cost)
+        prev = curr
+
+    return prev[lb]
+
+
+def _similarity(a: list[int], b: list[int]) -> float:
+    """Normalised similarity in [0.0, 1.0]; 1.0 means identical."""
+    max_len = max(len(a), len(b))
+    if max_len == 0:
+        return 1.0
+    return 1.0 - _levenshtein(a, b) / max_len
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def search_exact_match(query_notes: list[str], index: Index) -> list[SearchResult]:
+    """Return all index entries whose interval signature exactly matches the query.
+
+    Args:
+        query_notes: Ordered pitch strings (e.g. ``["C4", "D4", "E4"]``).
+        index: Inverted index from ``index_store.load_index``.
+
+    Returns:
+        List of match dicts (``{"file", "segment_index"}``), unranked.
+        Empty list when there is no exact match or fewer than 2 notes.
+
+    Raises:
+        TypeError: Wrong argument types.
+        ValueError: Invalid note string.
+    """
+    if not isinstance(query_notes, list):
+        raise TypeError(f"'query_notes' must be a list, got {type(query_notes).__name__}.")
+    if not isinstance(index, dict):
+        raise TypeError(f"'index' must be a dict, got {type(index).__name__}.")
+
+    intervals = encode_intervals(query_notes)
+    if not intervals:
+        return []
+
+    return list(index.get(str(intervals), []))
+
+
+def search_fuzzy_match(
+    query_notes: list[str],
+    index: Index,
+    *,
+    top_n: int = 20,
+    min_score: float = 0.5,
+    segment_length: int | None = None,
+) -> list[SearchResult]:
+    """Search the index with fuzzy interval matching and confidence scoring.
+
+    Strategy
+    --------
+    1. If the query is longer than ``segment_length``, it is split into
+       overlapping sub-queries via ``create_segments``; each sub-query is
+       searched independently. This mirrors how the index was built so that
+       long hummed phrases still find partial hits.
+    2. Every index key (an interval list) is compared against each sub-query
+       using normalised Levenshtein similarity.
+    3. Results are de-duplicated by ``(file, segment_index)`` — keeping only
+       the highest score for each location — then sorted descending by score.
+
+    Args:
+        query_notes: Ordered pitch strings.
+        index: Inverted index from ``index_store.load_index``.
+        top_n: Maximum number of results to return.
+        min_score: Minimum similarity threshold in ``[0, 1]``; hits below
+            this are discarded.  Default ``0.5`` (50 %).
+        segment_length: Window size used when building the index.  When
+            ``None``, the most common key length in the index is inferred
+            automatically.
+
+    Returns:
+        List of result dicts, each with keys ``"file"``, ``"segment_index"``,
+        and ``"score"`` (float 0–1). Sorted by score descending.
+
+    Raises:
+        TypeError: Wrong argument types.
+        ValueError: Invalid note strings.
+    """
+    if not isinstance(query_notes, list):
+        raise TypeError(f"'query_notes' must be a list, got {type(query_notes).__name__}.")
+    if not isinstance(index, dict):
+        raise TypeError(f"'index' must be a dict, got {type(index).__name__}.")
+
+    if not index:
+        return []
+
+    # --- Infer segment length from index when not supplied ---
+    if segment_length is None:
+        # The most frequent key length approximates the build-time segment_length
+        # minus 1 (each key is a list of *intervals*, so one shorter than notes).
+        from collections import Counter
+        length_counts: Counter[int] = Counter()
+        for key in index:
+            try:
+                length_counts[len(_parse_key(key))] += 1
+            except ValueError:
+                pass
+        if not length_counts:
+            return []
+        inferred_interval_len = length_counts.most_common(1)[0][0]
+        segment_length = inferred_interval_len + 1  # notes = intervals + 1
+
+    # --- Build sub-queries ---
+    if len(query_notes) <= segment_length:
+        sub_queries = [query_notes]
+    else:
+        sub_queries = create_segments(query_notes, segment_length=segment_length)
+
+    # Encode sub-queries; skip any that fail (e.g. bad note strings propagate
+    # as ValueError from encode_intervals, so we let the first one raise).
+    encoded_queries: list[list[int]] = []
+    for i, sq in enumerate(sub_queries):
+        intervals = encode_intervals(sq)
+        if intervals:
+            encoded_queries.append(intervals)
+
+    if not encoded_queries:
+        return []
+
+    # --- Score every index key against every sub-query ---
+    # best_score[(file, seg_idx)] = highest score seen so far
+    best: dict[tuple[str, int], float] = {}
+
+    parsed_index: list[tuple[list[int], list[dict[str, Any]]]] = []
+    for raw_key, entries in index.items():
+        try:
+            parsed_index.append((_parse_key(raw_key), entries))
+        except ValueError:
+            continue
+
+    for idx_intervals, entries in parsed_index:
+        for q_intervals in encoded_queries:
+            score = _similarity(q_intervals, idx_intervals)
+            if score < min_score:
+                continue
+            for entry in entries:
+                loc = (entry["file"], entry["segment_index"])
+                if score > best.get(loc, -1.0):
+                    best[loc] = score
+
+    # --- Assemble, sort, truncate ---
+    results: list[SearchResult] = [
+        {"file": file, "segment_index": seg_idx, "score": score}
+        for (file, seg_idx), score in best.items()
+    ]
+    results.sort(key=lambda r: r["score"], reverse=True)
+    return results[:top_n]
+
+
+def _parse_key(key: str) -> list[int]:
+    """Parse a stringified interval list back to ``list[int]``.
+
+    Raises:
+        ValueError: If ``key`` is not a valid ``"[int, ...]"`` string.
+    """
+    stripped = key.strip()
+    if not (stripped.startswith("[") and stripped.endswith("]")):
+        raise ValueError(f"Unexpected index key format: {key!r}")
+    inner = stripped[1:-1].strip()
+    if not inner:
+        return []
+    try:
+        return [int(x.strip()) for x in inner.split(",")]
+    except ValueError as exc:
+        raise ValueError(f"Non-integer element in index key: {key!r}") from exc"""Melody extraction from multi-track MIDI files.
+
+Pipeline
+--------
+1. Load the MIDI file with ``pretty_midi``.
+2. Drop drum instruments (``is_drum == True``).
+3. Drop non-melody instruments by General MIDI program number (bass,
+   synth pads, FX, percussive, sound effects).
+4. If every instrument was filtered out, fall back to all non-drum tracks
+   so the caller always gets *something* to work with.
+5. Apply the **Skyline Algorithm**: merge all remaining tracks and, at
+   every instant, keep only the highest-sounding pitch.
+6. Convert onset/offset times (seconds) to beat positions.
+7. Return a list of :class:`MelodyNote` named-tuples.
+
+General MIDI program exclusions
+--------------------------------
++----------+-------------------------+----------------------------------+
+| Range    | Category                | Reason excluded                  |
++==========+=========================+==================================+
+| 32–39    | Bass                    | Sub-melody register              |
++----------+-------------------------+----------------------------------+
+| 88–95    | Synth Pad               | Slow-attack chordal texture      |
++----------+-------------------------+----------------------------------+
+| 96–103   | Synth FX                | Non-pitched soundscapes          |
++----------+-------------------------+----------------------------------+
+| 112–127  | Percussive + SFX        | Rhythmic, non-pitched            |
++----------+-------------------------+----------------------------------+
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Sequence
+
+import numpy as np
+import pretty_midi
+
+log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# GM program-number filter
+# ---------------------------------------------------------------------------
+
+# Programs (0-indexed) whose tracks are unlikely to carry the melody line.
+_BASS_PROGRAMS: frozenset[int] = frozenset(range(32, 40))
+_PAD_PROGRAMS: frozenset[int] = frozenset(range(88, 96))
+_FX_PROGRAMS: frozenset[int] = frozenset(range(96, 104))
+_PERCUSSIVE_AND_SFX: frozenset[int] = frozenset(range(112, 128))
+
+_NON_MELODY_PROGRAMS: frozenset[int] = (
+    _BASS_PROGRAMS | _PAD_PROGRAMS | _FX_PROGRAMS | _PERCUSSIVE_AND_SFX
+)
+
+# Minimum number of notes an instrument must have to be considered.
+_MIN_INSTRUMENT_NOTES: int = 4
+
+
+# ---------------------------------------------------------------------------
+# Public data type
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class MelodyNote:
+    """One note in the extracted monophonic melody.
+
+    Attributes:
+        pitch: MIDI pitch number (0–127; 60 = middle C).
+        start_beat: Onset time in beats (0.0 = start of the file).
+        duration_beats: Note duration in beats.
+    """
+
+    pitch: int
+    start_beat: float
+    duration_beats: float
+
+    def __str__(self) -> str:
+        name = pretty_midi.note_number_to_name(self.pitch)
+        return (
+            f"{name:<3s}  pitch={self.pitch:3d}  "
+            f"start={self.start_beat:.3f}b  dur={self.duration_beats:.3f}b"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Exceptions
+# ---------------------------------------------------------------------------
+
+class MelodyExtractionError(Exception):
+    """Raised when a MIDI file cannot be parsed or yields no melody."""
+
+
+# ---------------------------------------------------------------------------
+# Core class
+# ---------------------------------------------------------------------------
+
+class MelodyExtractor:
+    """Extract a monophonic melody sequence from a multi-track MIDI file.
+
+    Args:
+        min_duration_beats: Notes shorter than this (in beats) are discarded
+            as likely artifacts.  Default 0.05 ≈ a 64th-note at 120 BPM.
+    """
+
+    def __init__(self, min_duration_beats: float = 0.05) -> None:
+        self._min_dur = min_duration_beats
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def extract(self, midi_path: Path | str) -> list[MelodyNote]:
+        """Extract a monophonic melody from *midi_path*.
+
+        Args:
+            midi_path: Path to a ``.mid`` / ``.midi`` file.
+
+        Returns:
+            Ordered list of :class:`MelodyNote` objects (may be empty if the
+            file contains no usable pitched content).
+
+        Raises:
+            MelodyExtractionError: If the file cannot be loaded by
+                ``pretty_midi`` (corrupted header, truncated file, etc.).
+        """
+        path = Path(midi_path)
+        try:
+            pm = pretty_midi.PrettyMIDI(str(path))
+        except Exception as exc:
+            raise MelodyExtractionError(
+                f"pretty_midi could not load {path}: {exc}"
+            ) from exc
+
+        beat_times: np.ndarray = pm.get_beats()
+        if len(beat_times) < 2:
+            log.warning("%s: fewer than 2 beats detected — returning empty melody.", path.name)
+            return []
+
+        instruments = self._filter_instruments(pm.instruments)
+        if not instruments:
+            log.warning(
+                "%s: all instruments filtered out; falling back to all non-drum tracks.",
+                path.name,
+            )
+            instruments = [i for i in pm.instruments if not i.is_drum]
+
+        raw_notes: list[pretty_midi.Note] = [
+            note
+            for instr in instruments
+            for note in instr.notes
+        ]
+
+        if not raw_notes:
+            log.warning("%s: no notes remain after filtering.", path.name)
+            return []
+
+        skyline_notes = self._skyline(raw_notes)
+        melody = self._to_beat_sequence(skyline_notes, beat_times)
+        log.debug(
+            "%s: %d raw notes → %d skyline → %d melody notes.",
+            path.name, len(raw_notes), len(skyline_notes), len(melody),
+        )
+        return melody
+
+    # ------------------------------------------------------------------
+    # Instrument filter
+    # ------------------------------------------------------------------
+
+    def _filter_instruments(
+        self, instruments: Sequence[pretty_midi.Instrument]
+    ) -> list[pretty_midi.Instrument]:
+        """Return only instruments likely to carry a melody line.
+
+        Drops:
+        - Drum instruments (``is_drum == True``).
+        - Instruments whose GM program number falls in :data:`_NON_MELODY_PROGRAMS`.
+        - Instruments with fewer than :data:`_MIN_INSTRUMENT_NOTES` notes.
+        """
+        kept: list[pretty_midi.Instrument] = []
+        for instr in instruments:
+            if instr.is_drum:
+                continue
+            if instr.program in _NON_MELODY_PROGRAMS:
+                log.debug(
+                    "Skipping instrument %r (prog=%d) — non-melody program.",
+                    instr.name, instr.program,
+                )
+                continue
+            if len(instr.notes) < _MIN_INSTRUMENT_NOTES:
+                log.debug(
+                    "Skipping instrument %r (prog=%d) — only %d notes.",
+                    instr.name, instr.program, len(instr.notes),
+                )
+                continue
+            kept.append(instr)
+        return kept
+
+    # ------------------------------------------------------------------
+    # Skyline algorithm
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _skyline(notes: list[pretty_midi.Note]) -> list[pretty_midi.Note]:
+        """Apply the Skyline Algorithm to produce a monophonic note list.
+
+        At any instant, the note with the highest pitch wins.  When a
+        higher-pitched note starts while a lower-pitched note is still
+        sounding, the lower note is trimmed to the new note's onset time.
+        Notes that start after all current notes have ended are appended
+        as-is.
+
+        Args:
+            notes: All notes from all melody-eligible instruments, in any order.
+
+        Returns:
+            A list of non-overlapping :class:`pretty_midi.Note` objects in
+            chronological order.
+        """
+        # Primary sort: onset time; secondary: pitch descending (higher pitch
+        # wins when two notes start at exactly the same instant).
+        sorted_notes = sorted(notes, key=lambda n: (n.start, -n.pitch))
+
+        melody: list[pretty_midi.Note] = []
+        cur_pitch: int = -1
+        cur_start: float = 0.0
+        cur_end: float = 0.0
+        cur_velocity: int = 64
+
+        for note in sorted_notes:
+            if note.start >= cur_end:
+                # Clean boundary or gap — emit the running note and start a new one.
+                if cur_pitch >= 0:
+                    melody.append(
+                        pretty_midi.Note(
+                            velocity=cur_velocity,
+                            pitch=cur_pitch,
+                            start=cur_start,
+                            end=cur_end,
+                        )
+                    )
+                cur_pitch = note.pitch
+                cur_start = note.start
+                cur_end = note.end
+                cur_velocity = note.velocity
+
+            elif note.pitch > cur_pitch:
+                # Higher-pitched note overlaps: trim running note and take over.
+                if cur_pitch >= 0 and note.start > cur_start:
+                    melody.append(
+                        pretty_midi.Note(
+                            velocity=cur_velocity,
+                            pitch=cur_pitch,
+                            start=cur_start,
+                            end=note.start,  # trimmed
+                        )
+                    )
+                cur_pitch = note.pitch
+                cur_start = note.start
+                cur_end = max(cur_end, note.end)
+                cur_velocity = note.velocity
+
+            elif note.end > cur_end and note.pitch == cur_pitch:
+                # Same pitch, extends the current note — lengthen it.
+                cur_end = note.end
+
+            # else: lower-pitched note during a higher active note — discard.
+
+        # Flush the last running note.
+        if cur_pitch >= 0:
+            melody.append(
+                pretty_midi.Note(
+                    velocity=cur_velocity,
+                    pitch=cur_pitch,
+                    start=cur_start,
+                    end=cur_end,
+                )
+            )
+
+        return melody
+
+    # ------------------------------------------------------------------
+    # Beat conversion
+    # ------------------------------------------------------------------
+
+    def _to_beat_sequence(
+        self,
+        notes: list[pretty_midi.Note],
+        beat_times: np.ndarray,
+    ) -> list[MelodyNote]:
+        """Convert a list of timed notes to beat-position :class:`MelodyNote` objects.
+
+        Uses linear interpolation between adjacent beat timestamps.  Notes
+        outside the range of ``beat_times`` are extrapolated using the last
+        known inter-beat interval so that pickup bars and trailing notes are
+        handled gracefully.
+
+        Notes shorter than ``min_duration_beats`` are dropped.
+
+        Args:
+            notes: Monophonic note list from :meth:`_skyline`.
+            beat_times: Array of beat onset times in seconds, as returned by
+                :func:`pretty_midi.PrettyMIDI.get_beats`.
+
+        Returns:
+            Ordered list of :class:`MelodyNote` with beat-relative positions.
+        """
+        result: list[MelodyNote] = []
+        for note in notes:
+            start_b = _seconds_to_beat(note.start, beat_times)
+            end_b = _seconds_to_beat(note.end, beat_times)
+            dur_b = end_b - start_b
+            if dur_b < self._min_dur:
+                continue
+            result.append(MelodyNote(pitch=note.pitch, start_beat=start_b, duration_beats=dur_b))
+        return result
+
+
+# ---------------------------------------------------------------------------
+# Helper
+# ---------------------------------------------------------------------------
+
+def _seconds_to_beat(t: float, beat_times: np.ndarray) -> float:
+    """Convert a time in seconds to a fractional beat position.
+
+    Interpolates between adjacent beats; extrapolates using the last
+    inter-beat interval for times beyond the final beat.
+    """
+    n = len(beat_times)
+    # Find the beat interval that contains t.
+    idx = int(np.searchsorted(beat_times, t, side="right")) - 1
+
+    if idx < 0:
+        # Before the first beat — extrapolate backwards.
+        dt = beat_times[1] - beat_times[0]
+        return (t - beat_times[0]) / dt if dt > 0 else 0.0
+
+    if idx >= n - 1:
+        # After the last beat — extrapolate forwards.
+        dt = beat_times[-1] - beat_times[-2]
+        return (n - 1) + ((t - beat_times[-1]) / dt if dt > 0 else 0.0)
+
+    dt = beat_times[idx + 1] - beat_times[idx]
+    frac = (t - beat_times[idx]) / dt if dt > 0 else 0.0
+    return idx + frac
+"""Sliding-window segmentation of note sequences for melody indexing."""
+
+from __future__ import annotations
+
+from typing import TypeVar
+
+T = TypeVar("T")
+
+
+def create_segments(notes: list[T], segment_length: int = 5) -> list[list[T]]:
+    """Split a note sequence into overlapping fixed-length windows.
+
+    Each consecutive window is offset by one note, so every possible
+    sub-melody of the given length is represented exactly once. This
+    makes the output suitable for bulk interval encoding and index
+    population.
+
+    Args:
+        notes: Ordered sequence of notes (any element type — typically
+            ``str`` pitch names or ``music21.note.Note`` objects).
+        segment_length: Number of notes per segment. Must be >= 1.
+
+    Returns:
+        A list of segments, where each segment is a sub-list of length
+        ``segment_length``. Returns an empty list when ``notes`` contains
+        fewer elements than ``segment_length``.
+
+        Example::
+
+            create_segments(["A", "B", "C", "D", "E"], segment_length=3)
+            # -> [["A", "B", "C"], ["B", "C", "D"], ["C", "D", "E"]]
+
+    Raises:
+        TypeError: If ``notes`` is not a list or ``segment_length`` is not an int.
+        ValueError: If ``segment_length`` is less than 1.
+    """
+    if not isinstance(notes, list):
+        raise TypeError(
+            f"'notes' must be a list, got {type(notes).__name__}."
+        )
+    if not isinstance(segment_length, int):
+        raise TypeError(
+            f"'segment_length' must be an int, got {type(segment_length).__name__}."
+        )
+    if segment_length < 1:
+        raise ValueError(
+            f"'segment_length' must be >= 1, got {segment_length}."
+        )
+
+    if len(notes) < segment_length:
+        return []
+
+    return [notes[i : i + segment_length] for i in range(len(notes) - segment_length + 1)]
+
+
+if __name__ == "__main__":
+    demo_notes = ["C4", "D4", "E4", "F4", "G4", "A4", "B4"]
+    segment_length = 3
+
+    print("Input notes:", demo_notes)
+    print(f"Segment length: {segment_length}")
+    print()
+
+    segments = create_segments(demo_notes, segment_length=segment_length)
+    print(f"Produced {len(segments)} segment(s):")
+    for i, seg in enumerate(segments):
+        print(f"  [{i}] {seg}")
+
+    print()
+    print("Edge case — list shorter than segment length:")
+    short = create_segments(["C4", "D4"], segment_length=5)
+    print(f"  create_segments(['C4', 'D4'], segment_length=5) -> {short}")
+"""Phase 0.3 — Evaluation metrics for query-by-humming retrieval.
+
+All functions operate on a *ranked list* of retrieved song IDs (index 0 = top
+result) and a *ground-truth song ID* (string).  The corpus may contain multiple
+acceptable answers for one query in future, but the current QbH benchmark has
+exactly one correct song per query.
+
+Metric reference
+----------------
+MRR@k  (Mean Reciprocal Rank)
+    Primary metric.  For a single query, the reciprocal rank is 1/r if the
+    correct song appears at rank r ≤ k, or 0 otherwise.  Average over all
+    queries to get MRR@k.
+
+Hit@k
+    Binary: 1 if the correct song appears anywhere in the top-k results.
+    Average over all queries to get Hit@k.
+
+Popularity-weighted Hit@10
+    Hit@10 restricted to queries whose ground-truth song falls in the bottom
+    50 % of the corpus by popularity.  Detects a ranker that "cheats" by
+    always returning popular songs.
+"""
+
+from __future__ import annotations
+
+import statistics
+from collections.abc import Sequence
+from typing import Optional
+
+
+def reciprocal_rank(ranked_list: Sequence[str], ground_truth: str, k: int = 10) -> float:
+    """Return the reciprocal rank of *ground_truth* in the top-k results.
+
+    Args:
+        ranked_list: Retrieved song IDs ordered by descending relevance.
+        ground_truth: The single correct song ID for this query.
+        k: Rank cutoff; results beyond position k are ignored.
+
+    Returns:
+        ``1 / r`` where ``r`` is the 1-based rank of *ground_truth*, or
+        ``0.0`` if it does not appear in the top-k results or if
+        *ranked_list* is empty.
+    """
+    if not ranked_list or not ground_truth:
+        return 0.0
+
+    for rank, song_id in enumerate(ranked_list[:k], start=1):
+        if song_id == ground_truth:
+            return 1.0 / rank
+
+    return 0.0
+
+
+def hit(ranked_list: Sequence[str], ground_truth: str, k: int) -> float:
+    """Return 1.0 if *ground_truth* appears in the top-k results, else 0.0.
+
+    Args:
+        ranked_list: Retrieved song IDs ordered by descending relevance.
+        ground_truth: The single correct song ID for this query.
+        k: Rank cutoff.
+
+    Returns:
+        ``1.0`` on a hit, ``0.0`` on a miss.  Returns ``0.0`` for empty
+        inputs rather than raising.
+    """
+    if not ranked_list or not ground_truth or k < 1:
+        return 0.0
+
+    return 1.0 if ground_truth in ranked_list[:k] else 0.0
+
+
+# ---------------------------------------------------------------------------
+# Corpus-level aggregation
+# ---------------------------------------------------------------------------
+
+
+def mrr_at_k(
+    ranked_lists: Sequence[Sequence[str]],
+    ground_truths: Sequence[str],
+    k: int = 10,
+) -> float:
+    """Mean Reciprocal Rank at k over a set of queries.
+
+    Args:
+        ranked_lists: One ranked result list per query.
+        ground_truths: Parallel sequence of correct song IDs.
+        k: Rank cutoff applied to every query.
+
+    Returns:
+        Mean of per-query reciprocal ranks in [0.0, 1.0].  Returns ``0.0``
+        when *ranked_lists* is empty.
+
+    Raises:
+        ValueError: If *ranked_lists* and *ground_truths* differ in length.
+    """
+    _check_parallel(ranked_lists, ground_truths)
+    if not ranked_lists:
+        return 0.0
+
+    scores = [
+        reciprocal_rank(rl, gt, k=k)
+        for rl, gt in zip(ranked_lists, ground_truths)
+    ]
+    return statistics.mean(scores)
+
+
+def hit_at_k(
+    ranked_lists: Sequence[Sequence[str]],
+    ground_truths: Sequence[str],
+    k: int,
+) -> float:
+    """Hit rate at k over a set of queries.
+
+    Args:
+        ranked_lists: One ranked result list per query.
+        ground_truths: Parallel sequence of correct song IDs.
+        k: Rank cutoff.
+
+    Returns:
+        Fraction of queries for which the correct song is in the top-k
+        results.  Returns ``0.0`` when *ranked_lists* is empty.
+
+    Raises:
+        ValueError: If *ranked_lists* and *ground_truths* differ in length.
+    """
+    _check_parallel(ranked_lists, ground_truths)
+    if not ranked_lists:
+        return 0.0
+
+    scores = [hit(rl, gt, k=k) for rl, gt in zip(ranked_lists, ground_truths)]
+    return statistics.mean(scores)
+
+
+def popularity_weighted_hit_at_10(
+    ranked_lists: Sequence[Sequence[str]],
+    ground_truths: Sequence[str],
+    popularity_scores: dict[str, float],
+) -> float:
+    """Hit@10 restricted to queries whose ground truth is in the bottom 50 % by popularity.
+
+    This metric reveals whether the ranker is secretly cheating by returning
+    hits — a system that always surfaces popular songs will score well on
+    standard Hit@10 but badly here.
+
+    Popularity scores must be in [0, 1] (normalised log-scores as stored in
+    ``songs.parquet``).  Songs absent from *popularity_scores* are assumed to
+    have popularity 0.0 (treated as unpopular).
+
+    Args:
+        ranked_lists: One ranked result list per query.
+        ground_truths: Parallel sequence of correct song IDs.
+        popularity_scores: Mapping of song ID → normalised popularity in [0, 1].
+
+    Returns:
+        Hit@10 computed only over the unpopular-ground-truth queries.  Returns
+        ``0.0`` when no such queries exist or *ranked_lists* is empty.
+
+    Raises:
+        ValueError: If *ranked_lists* and *ground_truths* differ in length.
+    """
+    _check_parallel(ranked_lists, ground_truths)
+    if not ranked_lists:
+        return 0.0
+
+    if popularity_scores:
+        threshold = statistics.median(popularity_scores.values())
+    else:
+        threshold = 0.0
+
+    filtered: list[tuple[Sequence[str], str]] = [
+        (rl, gt)
+        for rl, gt in zip(ranked_lists, ground_truths)
+        if popularity_scores.get(gt, 0.0) <= threshold
+    ]
+
+    if not filtered:
+        return 0.0
+
+    scores = [hit(rl, gt, k=10) for rl, gt in filtered]
+    return statistics.mean(scores)
+
+
+def compute_all(
+    ranked_lists: Sequence[Sequence[str]],
+    ground_truths: Sequence[str],
+    popularity_scores: Optional[dict[str, float]] = None,
+) -> dict[str, float]:
+    """Convenience wrapper — compute the full standard metric suite at once.
+
+    Args:
+        ranked_lists: One ranked result list per query.
+        ground_truths: Parallel sequence of correct song IDs.
+        popularity_scores: Optional mapping used for the popularity-weighted
+            metric.  When ``None``, that metric is omitted from the output.
+
+    Returns:
+        Dict with keys ``mrr@10``, ``hit@1``, ``hit@5``, ``hit@10``, and
+        (conditionally) ``pop_weighted_hit@10``.
+
+    Raises:
+        ValueError: If *ranked_lists* and *ground_truths* differ in length.
+    """
+    _check_parallel(ranked_lists, ground_truths)
+
+    results: dict[str, float] = {
+        "mrr@10": mrr_at_k(ranked_lists, ground_truths, k=10),
+        "hit@1": hit_at_k(ranked_lists, ground_truths, k=1),
+        "hit@5": hit_at_k(ranked_lists, ground_truths, k=5),
+        "hit@10": hit_at_k(ranked_lists, ground_truths, k=10),
+    }
+
+    if popularity_scores is not None:
+        results["pop_weighted_hit@10"] = popularity_weighted_hit_at_10(
+            ranked_lists, ground_truths, popularity_scores
+        )
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+
+def _check_parallel(a: Sequence[object], b: Sequence[object]) -> None:
+    if len(a) != len(b):
+        raise ValueError(
+            f"ranked_lists and ground_truths must have the same length, "
+            f"got {len(a)} and {len(b)}."
+        )
+"""Loaders for the Phase 0 frozen evaluation datasets.
+
+MIR-QBSH expected layout
+--------------------------
+    data/v2/eval/mir_qbsh/
+        QBSHdata/
+            <song_id>/          # folder name is the ground-truth song ID
+                <query_id>.wav  # one or more hummed queries per song
+
+The ground-truth song ID is derived from the immediate parent folder of each
+query file, so the extraction layout must be preserved.
+
+A query entry has the shape::
+
+    {
+        "query_audio_path": Path,   # absolute path to the .wav file
+        "ground_truth_song_id": str # parent folder name
+    }
+
+The loader never raises on an empty or missing directory; it logs a warning
+and returns an empty list so downstream code can decide whether to abort.
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterator
+
+log = logging.getLogger(__name__)
+
+# Supported audio extensions for query files.
+_AUDIO_EXTENSIONS: frozenset[str] = frozenset({".wav", ".mp3", ".m4a", ".flac"})
+# Supported symbolic extensions (for MIDI-only corpora / future use).
+_MIDI_EXTENSIONS: frozenset[str] = frozenset({".mid", ".midi"})
+_ALL_EXTENSIONS: frozenset[str] = _AUDIO_EXTENSIONS | _MIDI_EXTENSIONS
+
+
+@dataclass(frozen=True)
+class EvalQuery:
+    """A single evaluation query with its ground-truth label."""
+
+    query_audio_path: Path
+    ground_truth_song_id: str
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "query_audio_path": self.query_audio_path,
+            "ground_truth_song_id": self.ground_truth_song_id,
+        }
+
+
+class MIR_QBSH_Loader:
+    """Load hummed-query entries from an extracted MIR-QBSH dataset directory.
+
+    Parameters
+    ----------
+    dataset_root:
+        Path to ``data/v2/eval/mir_qbsh/``.  The loader descends into the
+        ``QBSHdata/`` sub-directory automatically when it is present; if the
+        directory is empty or missing it logs a warning and returns no entries.
+    strict:
+        When ``True``, raises ``FileNotFoundError`` if the directory does not
+        exist.  When ``False`` (default) it logs a warning and returns ``[]``.
+    """
+
+    # MIR-QBSH stores queries under this sub-directory after extraction.
+    _QBSH_SUBDIR = "QBSHdata"
+
+    def __init__(self, dataset_root: str | Path, *, strict: bool = False) -> None:
+        self._root = Path(dataset_root).resolve()
+        self._strict = strict
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def load(self) -> list[dict[str, object]]:
+        """Return a list of query dicts, one per audio file found.
+
+        Each dict has the shape::
+
+            {
+                "query_audio_path": Path,
+                "ground_truth_song_id": str,
+            }
+
+        Returns an empty list (with a warning) when no files are found.
+        """
+        return [q.as_dict() for q in self._iter_queries()]
+
+    def load_typed(self) -> list[EvalQuery]:
+        """Same as :meth:`load` but returns :class:`EvalQuery` dataclasses."""
+        return list(self._iter_queries())
+
+    def __len__(self) -> int:
+        return sum(1 for _ in self._iter_query_files())
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _effective_root(self) -> Path | None:
+        """Resolve the directory that actually contains song-ID sub-folders.
+
+        Prefers ``<root>/QBSHdata/`` when it exists; falls back to ``<root>``
+        itself so the loader works with both the standard archive layout and a
+        flat custom layout.
+        """
+        if not self._root.exists():
+            msg = "MIR-QBSH dataset directory not found: %s"
+            if self._strict:
+                raise FileNotFoundError(msg % self._root)
+            log.warning(msg, self._root)
+            log.warning(
+                "Download the dataset and extract it there.  "
+                "Run `python scripts/v2/setup_eval.py` for instructions."
+            )
+            return None
+
+        preferred = self._root / self._QBSH_SUBDIR
+        if preferred.is_dir():
+            return preferred
+
+        # Fall back: if the root has immediate sub-directories that contain
+        # audio files, treat the root itself as the songs directory.
+        has_song_dirs = any(
+            child.is_dir() and self._dir_has_audio(child)
+            for child in self._root.iterdir()
+        )
+        if has_song_dirs:
+            log.debug("Using %s as song root (no QBSHdata sub-dir found).", self._root)
+            return self._root
+
+        log.warning(
+            "MIR-QBSH directory exists but appears empty or has an unexpected layout: %s",
+            self._root,
+        )
+        log.warning(
+            "Expected: %s/<song_id>/<query>.wav  or  %s/QBSHdata/<song_id>/<query>.wav",
+            self._root,
+            self._root,
+        )
+        return None
+
+    def _iter_queries(self) -> Iterator[EvalQuery]:
+        effective_root = self._effective_root()
+        if effective_root is None:
+            return
+
+        found_any = False
+        for query_path in self._iter_query_files(effective_root):
+            song_id = query_path.parent.name
+            if not song_id:
+                log.warning("Could not determine song ID for %s — skipping.", query_path)
+                continue
+            found_any = True
+            yield EvalQuery(
+                query_audio_path=query_path,
+                ground_truth_song_id=song_id,
+            )
+
+        if not found_any:
+            log.warning(
+                "No query files (%s) found under %s.",
+                ", ".join(sorted(_ALL_EXTENSIONS)),
+                effective_root,
+            )
+            log.warning(
+                "If you haven't downloaded the dataset yet, run: "
+                "python scripts/v2/setup_eval.py"
+            )
+
+    def _iter_query_files(self, root: Path | None = None) -> Iterator[Path]:
+        """Yield all audio/MIDI files one level below the song-ID folders."""
+        search_root = root or self._effective_root()
+        if search_root is None:
+            return
+
+        for song_dir in sorted(search_root.iterdir()):
+            if not song_dir.is_dir():
+                continue
+            for candidate in sorted(song_dir.iterdir()):
+                if candidate.is_file() and candidate.suffix.lower() in _ALL_EXTENSIONS:
+                    yield candidate
+
+    @staticmethod
+    def _dir_has_audio(directory: Path) -> bool:
+        return any(
+            f.suffix.lower() in _ALL_EXTENSIONS
+            for f in directory.iterdir()
+            if f.is_file()
+        )
+"""Last.fm API client with rate limiting and exponential backoff.
+
+Setup
+-----
+1. Register for a free API key at https://www.last.fm/api/account/create
+2. Create a ``.env`` file in the project root::
+
+       LASTFM_API_KEY=your_key_here
+
+3. ``pip install python-dotenv requests`` (or install via pyproject.toml extras)
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import time
+from typing import Any
+
+import requests
+from dotenv import load_dotenv
+
+load_dotenv()
+
+log = logging.getLogger(__name__)
+
+_BASE_URL = "https://ws.audioscrobbler.com/2.0/"
+
+# Last.fm embeds application-level errors inside HTTP 200 bodies.
+# Code 6 = "Track not found", codes 11/29 = rate-limited / service offline.
+_NOT_FOUND_CODE = 6
+_RETRYABLE_CODES = frozenset({11, 29})
+
+
+class LastFmError(Exception):
+    """Non-retryable Last.fm API error (invalid key, bad method, etc.)."""
+
+
+class LastFmClient:
+    """Thin, synchronous Last.fm API wrapper.
+
+    Args:
+        api_key: Last.fm API key. Defaults to ``LASTFM_API_KEY`` env var.
+        calls_per_second: Sustained request rate (default 3.0 — comfortably
+            under Last.fm's undocumented ~5 req/s soft limit).
+        max_retries: Attempts before giving up on a single call.
+    """
+
+    def __init__(
+        self,
+        api_key: str | None = None,
+        *,
+        calls_per_second: float = 3.0,
+        max_retries: int = 6,
+    ) -> None:
+        resolved = api_key or os.environ.get("LASTFM_API_KEY", "")
+        if not resolved:
+            raise ValueError(
+                "Last.fm API key not found. "
+                "Set LASTFM_API_KEY in your .env file or pass api_key=."
+            )
+        self._api_key = resolved
+        self._min_interval: float = 1.0 / max(calls_per_second, 0.01)
+        self._last_call: float = 0.0
+        self._max_retries = max_retries
+        self._session = requests.Session()
+        self._session.headers.update(
+            {"User-Agent": "melody-matcher/0.1 (research; tjli@mit.edu)"}
+        )
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def get_track_info(
+        self, artist: str, track: str
+    ) -> dict[str, int] | None:
+        """Fetch play count and listener count for a track.
+
+        Uses ``autocorrect=1`` so minor spelling variations are tolerated.
+
+        Returns:
+            ``{"playcount": int, "listeners": int}`` on success,
+            ``None`` if the track is not found on Last.fm.
+
+        Raises:
+            LastFmError: On non-retryable API errors (invalid key, etc.).
+        """
+        params = {
+            "method": "track.getInfo",
+            "api_key": self._api_key,
+            "artist": artist,
+            "track": track,
+            "autocorrect": "1",
+            "format": "json",
+        }
+        body = self._call(params)
+        if body is None:
+            return None
+
+        t = body.get("track", {})
+        try:
+            return {
+                "playcount": int(t.get("playcount", 0) or 0),
+                "listeners": int(t.get("listeners", 0) or 0),
+            }
+        except (ValueError, TypeError) as exc:
+            log.warning("Unexpected track.getInfo shape for %s – %s: %s", artist, track, exc)
+            return None
+
+    def close(self) -> None:
+        self._session.close()
+
+    def __enter__(self) -> "LastFmClient":
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _call(self, params: dict[str, str]) -> dict[str, Any] | None:
+        """Single API call with throttle + retry logic."""
+        for attempt in range(self._max_retries):
+            self._throttle()
+            try:
+                resp = self._session.get(_BASE_URL, params=params, timeout=15)
+            except requests.RequestException as exc:
+                log.warning("Network error (attempt %d/%d): %s", attempt + 1, self._max_retries, exc)
+                self._backoff(attempt)
+                continue
+
+            if resp.status_code == 200:
+                try:
+                    body: dict[str, Any] = resp.json()
+                except ValueError:
+                    log.warning("Non-JSON response on attempt %d", attempt + 1)
+                    self._backoff(attempt)
+                    continue
+
+                err_code = body.get("error")
+                if err_code is None:
+                    return body
+                if err_code == _NOT_FOUND_CODE:
+                    return None
+                if err_code in _RETRYABLE_CODES:
+                    log.warning("Last.fm soft rate-limit (code %d), backing off …", err_code)
+                    self._backoff(attempt)
+                    continue
+                raise LastFmError(
+                    f"Last.fm API error {err_code}: {body.get('message', '(no message)')}"
+                )
+
+            if resp.status_code in (429, 500, 502, 503, 504):
+                log.warning(
+                    "HTTP %d on attempt %d/%d — backing off …",
+                    resp.status_code, attempt + 1, self._max_retries,
+                )
+                self._backoff(attempt)
+                continue
+
+            # 4xx other than 429 are not retryable
+            log.error("Non-retryable HTTP %d for %s", resp.status_code, params.get("method"))
+            return None
+
+        log.error("Exhausted %d retries — giving up.", self._max_retries)
+        return None
+
+    def _throttle(self) -> None:
+        """Block until the minimum inter-call interval has elapsed."""
+        wait = self._min_interval - (time.monotonic() - self._last_call)
+        if wait > 0:
+            time.sleep(wait)
+        self._last_call = time.monotonic()
+
+    @staticmethod
+    def _backoff(attempt: int) -> None:
+        """Exponential backoff capped at 64 seconds."""
+        time.sleep(min(2 ** attempt, 64))
+"""Parser for the LMD-matched subset of the Lakh MIDI Dataset.
+
+Expected directory layout::
+
+    lmd_matched/
+        A/A/A/TRAAAAV128F421A322/
+            5c5e7099b7dbac0f00ff2b7b.mid
+            a7b3f1c2d4e5a6b7c8d9e0f1.mid
+        A/A/B/TRAABXG128F429B4A9/
+            3d4e5f6a7b8c9d0e1f2a3b4c.mid
+        ...
+
+Each leaf folder is a Million Song Dataset track ID (``TR`` + 16 uppercase
+alphanumerics).  It may contain **one or more** MIDI files, each named by
+its md5 hash.
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+from collections.abc import Iterator
+from pathlib import Path
+from typing import Any
+
+log = logging.getLogger(__name__)
+
+_MSD_ID_RE: re.Pattern[str] = re.compile(r"^TR[A-Z0-9]{16}$")
+
+_MIDI_EXTENSIONS: frozenset[str] = frozenset({".mid", ".midi"})
+
+# Files to skip unconditionally (beyond the hidden-file rule).
+_SKIP_NAMES: frozenset[str] = frozenset({"Thumbs.db", ".DS_Store"})
+
+# Directories whose contents are always skipped.
+_SKIP_DIRS: frozenset[str] = frozenset({"__MACOSX"})
+
+
+class LakhMatchedParser:
+    """Scan an LMD-matched directory tree and yield per-file metadata dicts.
+
+    Args:
+        root: Path to the top-level ``lmd_matched/`` directory.
+
+    Raises:
+        NotADirectoryError: If ``root`` does not exist or is not a directory.
+    """
+
+    def __init__(self, root: str | Path) -> None:
+        resolved = Path(root).resolve()
+        if not resolved.is_dir():
+            raise NotADirectoryError(
+                f"LMD root is not a directory (or does not exist): {resolved}\n"
+                "Download lmd_matched.tar.gz from https://colinraffel.com/projects/lmd/ "
+                "and extract it there."
+            )
+        self._root: Path = resolved
+        self._skipped_count: int = 0
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def iter_files(self) -> Iterator[dict[str, Any]]:
+        """Yield one metadata dict per valid MIDI file found under ``root``.
+
+        The generator never materialises the full file list in memory; it
+        traverses the tree lazily using :py:meth:`pathlib.Path.rglob`.
+
+        Yields:
+            A dict with the following keys:
+
+            * ``msd_id`` (str): The MSD track ID derived from the parent
+              folder name (e.g. ``"TRAAAAV128F421A322"``).
+            * ``midi_path`` (Path): Absolute, symlink-resolved path to the
+              MIDI file.
+            * ``md5`` (str): The md5 hash from the filename stem (e.g.
+              ``"5c5e7099b7dbac0f00ff2b7b"``).
+
+        Raises:
+            Nothing — all per-file errors are logged at WARNING level and
+            the file is skipped.
+        """
+        self._skipped_count = 0
+
+        for path in self._root.rglob("*"):
+            if not path.is_file():
+                continue
+
+            # Only process MIDI candidates; everything else is ignored silently.
+            if path.suffix.lower() not in _MIDI_EXTENSIONS:
+                continue
+
+            # --- Hidden files and known system artifacts ---
+            if path.name.startswith(".") or path.name in _SKIP_NAMES:
+                self._skipped_count += 1
+                continue
+
+            # --- macOS archive artifacts anywhere in the path ---
+            if _SKIP_DIRS.intersection(path.parts):
+                self._skipped_count += 1
+                continue
+
+            # --- Symlink-escape guard ---
+            try:
+                resolved = path.resolve()
+            except OSError as exc:
+                self._skipped_count += 1
+                log.warning("Could not resolve %s (%s) — skipping.", path, exc)
+                continue
+
+            if not resolved.is_relative_to(self._root):
+                self._skipped_count += 1
+                log.warning(
+                    "Symlink %s escapes root (%s) — skipping.", path, self._root
+                )
+                continue
+
+            # --- MSD ID validation ---
+            msd_id = path.parent.name
+            if not _MSD_ID_RE.fullmatch(msd_id):
+                self._skipped_count += 1
+                log.warning(
+                    "Non-MSD parent folder %r for file %s — skipping.", msd_id, path
+                )
+                continue
+
+            yield {
+                "msd_id": msd_id,
+                "midi_path": resolved,
+                "md5": path.stem,
+            }
+
+    def group_by_msd_id(self) -> dict[str, list[Path]]:
+        """Drain :meth:`iter_files` and group MIDI paths by MSD track ID.
+
+        Returns:
+            A dict mapping each MSD track ID to the list of absolute
+            :class:`~pathlib.Path` objects for its MIDI files.  The dict
+            and each inner list preserve insertion order (i.e. the
+            filesystem traversal order of :meth:`iter_files`).
+
+        Note:
+            Calling this method resets :attr:`skipped_count` as a side
+            effect of re-running the generator.
+        """
+        grouped: dict[str, list[Path]] = {}
+        for entry in self.iter_files():
+            grouped.setdefault(entry["msd_id"], []).append(entry["midi_path"])
+        return grouped
+
+    @property
+    def skipped_count(self) -> int:
+        """Number of MIDI-extension files skipped during the last :meth:`iter_files` traversal."""
+        return self._skipped_count
+"""Build the melody inverted index from a folder of MIDI files.
+
+Usage:
+    python scripts/build_index.py [--raw-dir PATH] [--out PATH] [--segment-length N]
+
+Defaults:
+    --raw-dir       data/raw/
+    --out           data/index/melody_index.json
+    --segment-length  5
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+import traceback
+from pathlib import Path
+
+# Allow running as a top-level script without installing the package.
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(_REPO_ROOT / "src"))
+
+from melody_matcher.features.interval_encoder import encode_intervals
+from melody_matcher.io.midi_reader import extract_notes_from_midi
+from melody_matcher.preprocessing.segmenter import create_segments
+from melody_matcher.storage.index_store import load_index, save_index
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Build the melody inverted index.")
+    parser.add_argument(
+        "--raw-dir",
+        type=Path,
+        default=_REPO_ROOT / "data" / "raw",
+        help="Directory containing .mid / .midi files (default: data/raw/)",
+    )
+    parser.add_argument(
+        "--out",
+        type=Path,
+        default=_REPO_ROOT / "data" / "index" / "melody_index.json",
+        help="Output JSON index path (default: data/index/melody_index.json)",
+    )
+    parser.add_argument(
+        "--segment-length",
+        type=int,
+        default=5,
+        help="Number of notes per segment (default: 5)",
+    )
+    return parser.parse_args()
+
+
+def _progress(current: int, total: int, label: str, width: int = 30) -> None:
+    """Print an in-place progress bar to stdout."""
+    filled = int(width * current / total) if total else width
+    bar = "#" * filled + "-" * (width - filled)
+    print(f"\r[{bar}] {current}/{total}  {label:<40}", end="", flush=True)
+
+
+def build_index(
+    raw_dir: Path,
+    out_path: Path,
+    segment_length: int,
+) -> None:
+    midi_files = sorted(
+        p for p in raw_dir.rglob("*") if p.suffix.lower() in {".mid", ".midi"}
+    )
+
+    if not midi_files:
+        print(f"No MIDI files found in {raw_dir}")
+        return
+
+    total = len(midi_files)
+    print(f"Found {total} MIDI file(s) in {raw_dir}")
+    print(f"Segment length: {segment_length} notes\n")
+
+    # Load any previously built index so incremental runs merge cleanly.
+    index = load_index(out_path)
+
+    ok_count = 0
+    err_count = 0
+
+    for i, midi_path in enumerate(midi_files, start=1):
+        rel = midi_path.relative_to(raw_dir)
+        _progress(i, total, str(rel))
+
+        try:
+            notes = extract_notes_from_midi(midi_path)
+        except Exception:
+            print(f"\n  [WARN] Skipping {rel} — could not extract notes:")
+            traceback.print_exc(limit=1)
+            err_count += 1
+            continue
+
+        segments = create_segments(notes, segment_length=segment_length)
+
+        if not segments:
+            print(f"\n  [WARN] Skipping {rel} — fewer than {segment_length} notes.")
+            err_count += 1
+            continue
+
+        for seg_idx, segment in enumerate(segments):
+            try:
+                intervals = encode_intervals(segment)
+            except Exception:
+                # A single bad segment should not abort the whole file.
+                continue
+
+            key = str(intervals)
+            entry = {"file": str(rel), "segment_index": seg_idx}
+
+            if key not in index:
+                index[key] = []
+            index[key].append(entry)
+
+        ok_count += 1
+
+    print()  # newline after progress bar
+    print(f"\nProcessed {ok_count}/{total} file(s) successfully ({err_count} skipped).")
+
+    dest = save_index(index, out_path)
+    unique_signatures = len(index)
+    total_entries = sum(len(v) for v in index.values())
+    print(f"Index saved to: {dest}")
+    print(f"  {unique_signatures:,} unique interval signatures")
+    print(f"  {total_entries:,} total index entries")
+
+
+if __name__ == "__main__":
+    args = _parse_args()
+    build_index(
+        raw_dir=args.raw_dir,
+        out_path=args.out,
+        segment_length=args.segment_length,
+    )
+"""Interactive CLI for melody search (exact + fuzzy).
+
+Usage:
+    python scripts/run_search.py [--index PATH] [--top N] [--min-score FLOAT]
+
+Type a space-separated note sequence at the prompt, e.g.:
+    > C4 D4 E4 F4 G4
+    > C D E            (octave 4 assumed when omitted)
+    > quit / exit      to stop
+"""
+
+from __future__ import annotations
+
+import argparse
+import re
+import sys
+from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(_REPO_ROOT / "src"))
+
+from melody_matcher.features.interval_encoder import encode_intervals
+from melody_matcher.search.search_service import search_exact_match, search_fuzzy_match
+from melody_matcher.storage.index_store import load_index
+
+_DEFAULT_INDEX = _REPO_ROOT / "data" / "index" / "melody_index.json"
+_DEFAULT_OCTAVE = "4"
+_NOTE_WITHOUT_OCTAVE = re.compile(r"^([A-Ga-g][#b]?)$")
+
+# ANSI colour helpers (gracefully degraded on Windows)
+_BOLD = "\033[1m"
+_GREEN = "\033[32m"
+_YELLOW = "\033[33m"
+_RED = "\033[31m"
+_RESET = "\033[0m"
+
+
+def _colourise(score: float) -> str:
+    """Return an ANSI-coloured confidence string."""
+    pct = f"{score * 100:.1f}%"
+    if score >= 0.9:
+        return f"{_GREEN}{_BOLD}{pct}{_RESET}"
+    if score >= 0.7:
+        return f"{_YELLOW}{pct}{_RESET}"
+    return f"{_RED}{pct}{_RESET}"
+
+
+def _normalise_notes(raw: str) -> list[str]:
+    """Split input and append default octave to bare note names."""
+    normalised: list[str] = []
+    for token in raw.split():
+        if _NOTE_WITHOUT_OCTAVE.match(token):
+            normalised.append(token + _DEFAULT_OCTAVE)
+        else:
+            normalised.append(token)
+    return normalised
+
+
+def _print_results(
+    results: list[dict],
+    query_notes: list[str],
+    exact_count: int,
+) -> None:
+    # Show the encoded signature so the user can see what was actually searched.
+    try:
+        sig = encode_intervals(query_notes)
+        print(f"  Interval signature : {sig}")
+    except Exception:
+        pass
+
+    if not results:
+        print("  No matches found.\n")
+        return
+
+    print(f"  {len(results)} result(s)  [{exact_count} exact]\n")
+    print(f"  {'#':>3}  {'Score':>7}  {'Segment':>7}  File")
+    print(f"  {'-'*3}  {'-'*7}  {'-'*7}  {'-'*40}")
+
+    for rank, hit in enumerate(results, start=1):
+        score = hit.get("score", 1.0)
+        marker = " *" if score == 1.0 else "  "
+        print(
+            f"  {rank:>3}{marker} {_colourise(score):>7}  "
+            f"#{hit['segment_index']:<6}  {hit['file']}"
+        )
+    print()
+    if exact_count:
+        print(f"  (* = exact match)\n")
+
+
+def run(index_path: Path, top_n: int, min_score: float) -> None:
+    print("Loading index...", end=" ", flush=True)
+    try:
+        index = load_index(index_path)
+    except Exception as exc:
+        print(f"\n[ERROR] Could not load index: {exc}")
+        sys.exit(1)
+
+    sig_count = len(index)
+    entry_count = sum(len(v) for v in index.values())
+    print(f"done.  ({sig_count:,} signatures · {entry_count:,} entries)\n")
+
+    print(f'Enter notes separated by spaces, e.g. "C4 D4 E4 F4 G4".')
+    print(f'Octave defaults to 4 when omitted.  "quit" / "exit" to stop.\n')
+
+    while True:
+        try:
+            raw = input("> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nGoodbye.")
+            break
+
+        if not raw:
+            continue
+        if raw.lower() in {"quit", "exit"}:
+            print("Goodbye.")
+            break
+
+        notes = _normalise_notes(raw)
+        print(f"  Query : {notes}")
+
+        if len(notes) < 2:
+            print("  Please enter at least 2 notes.\n")
+            continue
+
+        try:
+            exact = search_exact_match(notes, index)
+            fuzzy = search_fuzzy_match(notes, index, top_n=top_n, min_score=min_score)
+        except ValueError as exc:
+            print(f"  [ERROR] {exc}\n")
+            continue
+
+        # Merge: exact hits are guaranteed score=1.0; fuzzy may already include
+        # them. De-duplicate by (file, segment_index) so exact hits always show
+        # with score 1.0 and aren't doubled.
+        exact_keys = {(h["file"], h["segment_index"]) for h in exact}
+
+        # Promote exact hits to score 1.0 inside the fuzzy list.
+        for hit in fuzzy:
+            if (hit["file"], hit["segment_index"]) in exact_keys:
+                hit["score"] = 1.0
+
+        # Add any exact hits the fuzzy scan missed (score below min_score
+        # threshold but still a true hit).
+        seen = {(h["file"], h["segment_index"]) for h in fuzzy}
+        for hit in exact:
+            key = (hit["file"], hit["segment_index"])
+            if key not in seen:
+                fuzzy.insert(0, {**hit, "score": 1.0})
+
+        fuzzy.sort(key=lambda r: r["score"], reverse=True)
+        merged = fuzzy[:top_n]
+
+        _print_results(merged, notes, exact_count=len(exact_keys & seen | exact_keys))
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Interactive melody search CLI.")
+    parser.add_argument(
+        "--index",
+        type=Path,
+        default=_DEFAULT_INDEX,
+        help=f"Path to the JSON index (default: {_DEFAULT_INDEX.name})",
+    )
+    parser.add_argument(
+        "--top",
+        type=int,
+        default=20,
+        metavar="N",
+        help="Maximum results to display (default: 20)",
+    )
+    parser.add_argument(
+        "--min-score",
+        type=float,
+        default=0.5,
+        metavar="FLOAT",
+        help="Minimum similarity score 0–1 (default: 0.5)",
+    )
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    args = _parse_args()
+    run(args.index, top_n=args.top, min_score=args.min_score)"""Phase 1.1 — Ingest the LMD-matched MIDI corpus and write a manifest.
+
+Usage
+-----
+    python scripts/v2/ingest_lakh.py [options]
+
+    Options
+    -------
+    --midi-root     Root of the extracted lmd_matched/ tree
+                    (default: data/v2/raw_midi/lmd_matched/)
+    --manifest-out  Output path for the JSON manifest
+                    (default: data/v2/processed/lmd_manifest.json)
+    --log-level     Logging verbosity (default: INFO)
+
+Exit codes
+----------
+0   Success — manifest written.
+1   Internal error — traceback logged.
+2   Data missing — lmd_matched not found or contains no MIDI files.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import os
+import sys
+import traceback
+from datetime import datetime, timezone
+from pathlib import Path
+
+from tqdm import tqdm
+
+# ---------------------------------------------------------------------------
+# Path bootstrap — importable without `pip install -e .`
+# ---------------------------------------------------------------------------
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(_REPO_ROOT / "src"))
+
+from melody_matcher.data.lakh_parser import LakhMatchedParser  # noqa: E402
+
+# ---------------------------------------------------------------------------
+# Defaults
+# ---------------------------------------------------------------------------
+_DEFAULT_MIDI_ROOT = _REPO_ROOT / "data" / "v2" / "raw_midi" / "lmd_matched"
+_DEFAULT_MANIFEST_OUT = _REPO_ROOT / "data" / "v2" / "processed" / "lmd_manifest.json"
+_MIDI_EXTENSIONS: frozenset[str] = frozenset({".mid", ".midi"})
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _configure_logging(level: str) -> None:
+    logging.basicConfig(
+        level=level.upper(),
+        format="%(asctime)s  %(levelname)-8s  %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%S",
+    )
+
+
+def _has_midi_files(root: Path) -> bool:
+    """Return True as soon as any .mid/.midi file is found under *root*."""
+    return any(
+        p.suffix.lower() in _MIDI_EXTENSIONS
+        for p in root.rglob("*")
+        if p.is_file()
+    )
+
+
+def _print_download_instructions(midi_root: Path) -> None:
+    lines = [
+        f"LMD-matched dataset not found at {midi_root}.",
+        "Download it from: https://colinraffel.com/projects/lmd/",
+        "File: lmd_matched.tar.gz (~1.6 GB)",
+        "Extract with: tar -xzf lmd_matched.tar.gz -C data/v2/raw_midi/",
+    ]
+    for line in lines:
+        print(line, file=sys.stderr)
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Ingest LMD-matched MIDI corpus and write a JSON manifest.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    parser.add_argument(
+        "--midi-root",
+        type=Path,
+        default=_DEFAULT_MIDI_ROOT,
+        metavar="DIR",
+        help=f"Root of lmd_matched/ tree (default: {_DEFAULT_MIDI_ROOT})",
+    )
+    parser.add_argument(
+        "--manifest-out",
+        type=Path,
+        default=_DEFAULT_MANIFEST_OUT,
+        metavar="FILE",
+        help=f"Output JSON manifest path (default: {_DEFAULT_MANIFEST_OUT})",
+    )
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="Logging verbosity (default: INFO)",
+    )
+    return parser.parse_args()
+
+
+# ---------------------------------------------------------------------------
+# Main ingestion logic
+# ---------------------------------------------------------------------------
+
+
+def _run(args: argparse.Namespace) -> None:
+    log = logging.getLogger(__name__)
+
+    midi_root: Path = args.midi_root.resolve()
+    manifest_out: Path = args.manifest_out.resolve()
+
+    # --- Guard: data must be present ---
+    if not midi_root.is_dir() or not _has_midi_files(midi_root):
+        _print_download_instructions(args.midi_root)
+        sys.exit(2)
+
+    parser = LakhMatchedParser(midi_root)
+
+    # --- Pass 1: count valid files for a deterministic tqdm total ---
+    log.info("Pass 1/2 — counting valid MIDI files under %s …", midi_root)
+    valid_count = sum(1 for _ in parser.iter_files())
+    log.info("Pass 1/2 — %d valid MIDI files found.", valid_count)
+
+    # --- Pass 2: collect entries ---
+    log.info("Pass 2/2 — building manifest …")
+    grouped: dict[str, list[str]] = {}
+
+    with tqdm(total=valid_count, desc="Scanning", unit="file", leave=True) as pbar:
+        for entry in parser.iter_files():
+            msd_id: str = entry["msd_id"]
+            rel_path: str = entry["midi_path"].relative_to(midi_root).as_posix()
+            grouped.setdefault(msd_id, []).append(rel_path)
+            pbar.update(1)
+
+    skipped = parser.skipped_count
+
+    # --- Build manifest ---
+    entries: dict[str, list[str]] = {
+        msd_id: sorted(paths)
+        for msd_id, paths in sorted(grouped.items())
+    }
+    total_msd = len(entries)
+    total_midi = sum(len(v) for v in entries.values())
+
+    manifest: dict[str, object] = {
+        "schema_version": "1.0",
+        "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "midi_root": str(midi_root),
+        "stats": {
+            "total_msd_ids": total_msd,
+            "total_midi_files": total_midi,
+            "mean_midis_per_msd": (total_midi / total_msd) if total_msd else 0.0,
+            "skipped_files": skipped,
+        },
+        "entries": entries,
+    }
+
+    # --- Atomic write ---
+    manifest_out.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = manifest_out.with_name(manifest_out.name + ".tmp")
+    with tmp_path.open("w", encoding="utf-8") as fh:
+        json.dump(manifest, fh, indent=2, ensure_ascii=False)
+        fh.write("\n")
+    os.replace(tmp_path, manifest_out)
+
+    log.info(
+        "Manifest written → %s  (%d MSD IDs, %d MIDI files, %d skipped)",
+        manifest_out,
+        total_msd,
+        total_midi,
+        skipped,
+    )
+
+
+def main() -> None:
+    args = _parse_args()
+    _configure_logging(args.log_level)
+    log = logging.getLogger(__name__)
+
+    try:
+        _run(args)
+    except SystemExit:
+        raise
+    except Exception:
+        log.error("Internal error:\n%s", traceback.format_exc())
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
+"""Phase 1.5/1.6/1.7 — Build the processed melody corpus (songs.parquet).
+
+Pipeline
+--------
+For each MSD ID in lmd_manifest.json:
+
+1.  Try each associated MIDI file with MelodyExtractor.  Use the first
+    successful extraction that yields ≥ ``--min-notes`` notes.
+2.  **Phase 1.5 — Normalise** the note sequence to key- and tempo-invariant
+    features::
+
+        intervals  = [(semitone_delta_i, normalised_IOI_i), ...]   # N-1 pairs
+        parsons    = "UDUDR..."                                     # N-1 chars
+
+    *Semitone delta*: ``pitch[i+1] - pitch[i]`` — key-invariant because only
+    relative intervals are stored.
+    *Normalised IOI*: ``(onset[i+1] - onset[i]) / median_IOI`` — tempo-invariant
+    because we divide by the per-song median inter-onset interval.
+    *Parsons code*: ``U`` (up), ``D`` (down), ``R`` (repeat) from the sign of
+    each semitone delta — a coarse melodic contour.
+
+3.  **Phase 1.6 — Deduplicate** using a two-stage pipeline:
+
+    * *Exact*: songs whose serialised interval sequences are identical are
+      collapsed immediately (keeps the entry with the higher popularity score).
+    * *Near-duplicate*: within each Parsons-code group, pairwise DTW distance
+      (normalised by sequence length) is computed; groups below
+      ``--dtw-threshold`` are merged, keeping the most popular representative.
+      Groups larger than ``_DTW_GROUP_CAP`` skip DTW to avoid O(n²) cost —
+      they almost certainly contain genuinely distinct melodies.
+
+4.  **Phase 1.7 — Persist** the result as ``songs.parquet`` with columns:
+
+    =====================  =================================================
+    ``song_id``            MSD track ID (``TRXXXXXXXXXXXXXXXX``)
+    ``popularity_log``     Normalised log-playcount in [0.0, 1.0]
+    ``melody_notes_json``  JSON array of ``[pitch, start_beat, dur_beats]``
+    ``melody_intervals_json``  JSON array of ``[semitone_delta, norm_ioi]``
+    ``parsons_code``       ``"UDUDR…"`` contour string
+    ``source_midi_path``   Absolute path to the source MIDI file
+    =====================  =================================================
+
+Usage
+-----
+    python scripts/v2/build_corpus.py [options]
+
+Options
+-------
+    --manifest FILE     lmd_manifest.json  (default: data/v2/processed/)
+    --popularity FILE   popularity_scores.json  (default: same dir)
+    --out FILE          Output parquet  (default: data/v2/processed/songs.parquet)
+    --workers N         Parallel workers  (default: cpu_count - 1, min 1)
+    --min-notes N       Drop songs with fewer melody notes  (default: 5)
+    --dtw-threshold F   Normalised DTW distance for near-duplicate merging
+                        (default: 0.5)
+    --log-level LEVEL   DEBUG / INFO / WARNING / ERROR  (default: INFO)
+
+Exit codes: 0 success · 1 internal error · 2 missing inputs
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import multiprocessing
+import os
+import sys
+import traceback
+from collections import defaultdict
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import pandas as pd
+import statistics
+from fastdtw import fastdtw
+from tqdm import tqdm
+
+# ---------------------------------------------------------------------------
+# Path bootstrap — must run in both the main process AND spawned workers.
+# ---------------------------------------------------------------------------
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(_REPO_ROOT / "src"))
+
+from melody_matcher.preprocessing.melody_extractor import (  # noqa: E402
+    MelodyExtractionError,
+    MelodyExtractor,
+    MelodyNote,
+)
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+_DEFAULT_MANIFEST = _REPO_ROOT / "data" / "v2" / "processed" / "lmd_manifest.json"
+_DEFAULT_POPULARITY = _REPO_ROOT / "data" / "v2" / "processed" / "popularity_scores.json"
+_DEFAULT_OUT = _REPO_ROOT / "data" / "v2" / "processed" / "songs.parquet"
+
+# Groups larger than this skip pairwise DTW to bound worst-case O(n²) time.
+_DTW_GROUP_CAP = 50
+
+# Fallback popularity score for songs not found in the scores file.
+_DEFAULT_POPULARITY_SCORE = 0.5
+
+
+# ---------------------------------------------------------------------------
+# Phase 1.5 — Normalisation (pure, called inside workers)
+# ---------------------------------------------------------------------------
+
+def _compute_features(
+    notes: list[MelodyNote],
+) -> tuple[list[list[float]], str]:
+    """Normalise a melody to key- and tempo-invariant features.
+
+    Args:
+        notes: Ordered monophonic melody from :class:`MelodyExtractor`.
+
+    Returns:
+        A 2-tuple of:
+
+        * ``intervals`` — list of ``[semitone_delta, normalised_ioi]`` pairs
+          (length ``N-1`` for an ``N``-note melody).
+        * ``parsons_code`` — contour string of ``U`` / ``D`` / ``R`` characters
+          (also length ``N-1``).
+    """
+    if len(notes) < 2:
+        return [], ""
+
+    # Inter-onset intervals in beats (gap between consecutive note onsets).
+    iois: list[float] = [
+        notes[i + 1].start_beat - notes[i].start_beat
+        for i in range(len(notes) - 1)
+    ]
+
+    # Tempo-invariant normalisation: divide by the per-song median IOI.
+    median_ioi: float = statistics.median(iois)
+    if median_ioi <= 0.0:
+        median_ioi = 1.0
+    norm_iois = [ioi / median_ioi for ioi in iois]
+
+    # Semitone deltas — key-invariant because only relative motion is stored.
+    deltas: list[int] = [
+        notes[i + 1].pitch - notes[i].pitch
+        for i in range(len(notes) - 1)
+    ]
+
+    # Parsons code: U = up, D = down, R = repeat.
+    parsons: str = "".join(
+        "U" if d > 0 else "D" if d < 0 else "R" for d in deltas
+    )
+
+    intervals: list[list[float]] = [
+        [float(d), float(ioi)] for d, ioi in zip(deltas, norm_iois)
+    ]
+
+    return intervals, parsons
+
+
+# ---------------------------------------------------------------------------
+# Worker (must be a top-level function to survive multiprocessing spawn)
+# ---------------------------------------------------------------------------
+
+def _process_song(task: tuple[str, list[str], float, int]) -> dict[str, Any] | None:
+    """Extract and normalise the melody for one MSD ID.
+
+    Tries each MIDI path in order; returns the first successful result with
+    at least ``min_notes`` melody notes, or ``None`` if every path fails.
+
+    Args:
+        task: ``(msd_id, midi_paths, popularity_log, min_notes)`` where
+            *midi_paths* are absolute path strings.
+
+    Returns:
+        A row dict ready for a DataFrame, or ``None`` on failure.
+    """
+    msd_id, midi_paths, popularity_log, min_notes = task
+    extractor = MelodyExtractor()
+
+    for midi_path_str in midi_paths:
+        midi_path = Path(midi_path_str)
+        try:
+            notes: list[MelodyNote] = extractor.extract(midi_path)
+        except MelodyExtractionError:
+            continue
+
+        if len(notes) < min_notes:
+            continue
+
+        intervals, parsons = _compute_features(notes)
+
+        return {
+            "song_id": msd_id,
+            "popularity_log": popularity_log,
+            "melody_notes_json": json.dumps(
+                [[n.pitch, round(n.start_beat, 6), round(n.duration_beats, 6)]
+                 for n in notes]
+            ),
+            "melody_intervals_json": json.dumps(intervals),
+            "parsons_code": parsons,
+            "source_midi_path": str(midi_path.resolve()),
+        }
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Phase 1.6 — Deduplication
+# ---------------------------------------------------------------------------
+
+def _deduplicate(
+    rows: list[dict[str, Any]],
+    dtw_threshold: float,
+) -> tuple[list[dict[str, Any]], int, int]:
+    """Remove duplicate songs in two stages.
+
+    Stage 1 — **Exact**: identical serialised interval sequences are collapsed
+    immediately; the entry with the higher popularity score is kept.
+
+    Stage 2 — **Near-duplicate**: within each Parsons-code group (bounded to
+    ``_DTW_GROUP_CAP`` songs), pairwise FastDTW identifies songs whose melodic
+    intervals are below ``dtw_threshold`` distance per note. Clusters are
+    merged, keeping the most popular representative.
+
+    Args:
+        rows: Extracted corpus rows.
+        dtw_threshold: Normalised DTW distance threshold.
+
+    Returns:
+        ``(deduplicated_rows, exact_removed, dtw_removed)``
+    """
+    # ------------------------------------------------------------------
+    # Stage 1: exact interval-sequence deduplication
+    # ------------------------------------------------------------------
+    exact_index: dict[str, int] = {}   # intervals_json → index in deduped
+    deduped: list[dict[str, Any]] = []
+
+    for row in rows:
+        key: str = row["melody_intervals_json"]
+        if key in exact_index:
+            existing_idx = exact_index[key]
+            if row["popularity_log"] > deduped[existing_idx]["popularity_log"]:
+                deduped[existing_idx] = row
+                # index key stays the same
+        else:
+            exact_index[key] = len(deduped)
+            deduped.append(row)
+
+    exact_removed = len(rows) - len(deduped)
+
+    # ------------------------------------------------------------------
+    # Stage 2: DTW near-duplicate within Parsons-code groups
+    # ------------------------------------------------------------------
+    parsons_groups: dict[str, list[int]] = defaultdict(list)
+    for i, row in enumerate(deduped):
+        parsons_groups[row["parsons_code"]].append(i)
+
+    keep: set[int] = set()
+
+    for parsons_code, indices in parsons_groups.items():
+        if len(indices) == 1:
+            keep.add(indices[0])
+            continue
+
+        if len(indices) > _DTW_GROUP_CAP:
+            # Group is too large for O(n²) pairwise DTW.  These are almost
+            # certainly distinct songs that happen to share a coarse contour
+            # (e.g. "UUUUUU" is common in many genuinely different melodies).
+            keep.update(indices)
+            continue
+
+        # Build delta sequences for DTW (use semitone deltas only — IOI is
+        # already captured by the Parsons grouping step).
+        seqs: list[np.ndarray] = []
+        for idx in indices:
+            pairs = json.loads(deduped[idx]["melody_intervals_json"])
+            seqs.append(np.array([p[0] for p in pairs], dtype=np.float32))
+
+        # Union-Find for clustering near-duplicates.
+        parent = list(range(len(indices)))
+
+        def _find(x: int) -> int:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]   # path compression
+                x = parent[x]
+            return x
+
+        def _union(x: int, y: int) -> None:
+            parent[_find(x)] = _find(y)
+
+        for i in range(len(indices)):
+            for j in range(i + 1, len(indices)):
+                si, sj = seqs[i], seqs[j]
+                if len(si) == 0 or len(sj) == 0:
+                    continue
+                dist, _ = fastdtw(si, sj, dist=lambda a, b: abs(float(a) - float(b)))
+                norm_dist = dist / min(len(si), len(sj))
+                if norm_dist <= dtw_threshold:
+                    _union(i, j)
+
+        # Collect clusters; keep the most popular representative of each.
+        clusters: dict[int, list[int]] = defaultdict(list)
+        for local_i in range(len(indices)):
+            clusters[_find(local_i)].append(local_i)
+
+        for cluster_members in clusters.values():
+            best_local = max(
+                cluster_members,
+                key=lambda li: deduped[indices[li]]["popularity_log"],
+            )
+            keep.add(indices[best_local])
+
+    result = [deduped[i] for i in sorted(keep)]
+    dtw_removed = len(deduped) - len(result)
+
+    return result, exact_removed, dtw_removed
+
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+
+def _parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Build songs.parquet: extract, normalise, deduplicate.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    p.add_argument("--manifest", type=Path, default=_DEFAULT_MANIFEST, metavar="FILE")
+    p.add_argument("--popularity", type=Path, default=_DEFAULT_POPULARITY, metavar="FILE")
+    p.add_argument("--out", type=Path, default=_DEFAULT_OUT, metavar="FILE")
+    p.add_argument(
+        "--workers",
+        type=int,
+        default=max(1, (os.cpu_count() or 4) - 1),
+        metavar="N",
+        help="Parallel worker processes (default: cpu_count - 1)",
+    )
+    p.add_argument(
+        "--min-notes",
+        type=int,
+        default=5,
+        metavar="N",
+        help="Minimum melody notes to accept a song (default: 5)",
+    )
+    p.add_argument(
+        "--dtw-threshold",
+        type=float,
+        default=0.5,
+        metavar="F",
+        help="Normalised DTW distance for near-duplicate merging (default: 0.5)",
+    )
+    p.add_argument(
+        "--log-level",
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+    )
+    return p.parse_args()
+
+
+# ---------------------------------------------------------------------------
+# Main ingestion logic
+# ---------------------------------------------------------------------------
+
+def _run(args: argparse.Namespace) -> None:
+    log = logging.getLogger(__name__)
+
+    # --- Guard: inputs must exist ---
+    for label, path in [("manifest", args.manifest), ("popularity", args.popularity)]:
+        if not path.is_file():
+            print(f"{label} file not found: {path}", file=sys.stderr)
+            sys.exit(2)
+
+    # --- Load inputs ---
+    with args.manifest.open(encoding="utf-8") as fh:
+        manifest: dict[str, Any] = json.load(fh)
+
+    midi_root = Path(manifest["midi_root"])
+    entries: dict[str, list[str]] = manifest["entries"]
+    log.info("Manifest: %d MSD IDs, midi_root=%s", len(entries), midi_root)
+
+    with args.popularity.open(encoding="utf-8") as fh:
+        pop_data: dict[str, Any] = json.load(fh)
+
+    pop_scores: dict[str, float] = pop_data.get("scores", {})
+    fallback_score = pop_data.get("stats", {}).get("median_score", _DEFAULT_POPULARITY_SCORE)
+    log.info(
+        "Popularity scores: %d entries loaded (fallback=%.4f).",
+        len(pop_scores), fallback_score,
+    )
+
+    # --- Build task list ---
+    tasks: list[tuple[str, list[str], float, int]] = []
+    for msd_id, rel_paths in entries.items():
+        abs_paths = [str((midi_root / rp).resolve()) for rp in rel_paths]
+        pop = pop_scores.get(msd_id, fallback_score)
+        tasks.append((msd_id, abs_paths, pop, args.min_notes))
+
+    log.info(
+        "Starting extraction: %d songs, %d workers, min_notes=%d.",
+        len(tasks), args.workers, args.min_notes,
+    )
+
+    # --- Phase 1.4+1.5: parallel extraction + normalisation ---
+    rows: list[dict[str, Any]] = []
+    skipped = 0
+
+    with multiprocessing.Pool(processes=args.workers) as pool:
+        with tqdm(total=len(tasks), desc="Extracting", unit="song", dynamic_ncols=True) as pbar:
+            for result in pool.imap_unordered(_process_song, tasks, chunksize=8):
+                if result is not None:
+                    rows.append(result)
+                else:
+                    skipped += 1
+                pbar.update(1)
+                pbar.set_postfix(kept=len(rows), skipped=skipped, refresh=False)
+
+    log.info(
+        "Extraction complete: %d kept, %d skipped (corrupt / too few notes).",
+        len(rows), skipped,
+    )
+
+    if not rows:
+        log.error("No songs extracted — check --midi-root and MIDI files.")
+        sys.exit(2)
+
+    # --- Phase 1.6: deduplication ---
+    log.info(
+        "Deduplicating %d songs (DTW threshold=%.2f, group cap=%d) …",
+        len(rows), args.dtw_threshold, _DTW_GROUP_CAP,
+    )
+    rows, exact_removed, dtw_removed = _deduplicate(rows, args.dtw_threshold)
+    log.info(
+        "Deduplication: removed %d exact duplicates, %d near-duplicates. %d songs remain.",
+        exact_removed, dtw_removed, len(rows),
+    )
+
+    # --- Phase 1.7: save parquet ---
+    df = pd.DataFrame(
+        rows,
+        columns=[
+            "song_id",
+            "popularity_log",
+            "melody_notes_json",
+            "melody_intervals_json",
+            "parsons_code",
+            "source_midi_path",
+        ],
+    )
+
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(args.out, index=False, engine="pyarrow")
+
+    log.info(
+        "Saved %d songs → %s  (%.1f MB)",
+        len(df),
+        args.out,
+        args.out.stat().st_size / 1_048_576,
+    )
+
+    # --- Summary ---
+    print(
+        f"\n{'Corpus build summary':=<55}\n"
+        f"  MSD IDs in manifest   : {len(entries):>8,}\n"
+        f"  Extraction failures   : {skipped:>8,}\n"
+        f"  Kept after extraction : {len(rows) + exact_removed + dtw_removed:>8,}\n"
+        f"  Exact duplicates rm'd : {exact_removed:>8,}\n"
+        f"  Near-dupes rm'd (DTW) : {dtw_removed:>8,}\n"
+        f"  Final corpus size     : {len(df):>8,}\n"
+        f"  Output                : {args.out}\n"
+    )
+
+
+def main() -> None:
+    args = _parse_args()
+    logging.basicConfig(
+        level=args.log_level.upper(),
+        format="%(asctime)s  %(levelname)-8s  %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%S",
+    )
+    log = logging.getLogger(__name__)
+    try:
+        _run(args)
+    except SystemExit:
+        raise
+    except Exception:
+        log.error("Internal error:\n%s", traceback.format_exc())
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    multiprocessing.freeze_support()   # required for PyInstaller on Windows
+    main()
+"""
+Phase 0 — Evaluation harness setup.
+
+Run this script once to download and extract the MIR-QBSH dataset into the
+frozen eval directory.  The dataset must NEVER be used for training.
+
+Usage
+-----
+    source venv/bin/activate
+    python scripts/v2/setup_eval.py [--dry-run]
+
+Expected directory layout after extraction
+-------------------------------------------
+    data/v2/eval/mir_qbsh/
+        QBSHdata/
+            <song_id>/          # folder name == ground-truth song ID
+                <query_id>.wav  # one or more hummed queries per song
+        PitchFile/              # optional: pre-extracted pitch vectors (.pv)
+            <song_id>/
+                <query_id>.pv
+
+The MIR-QBSH loader (src/melody_matcher/eval/dataset_loader.py) derives the
+ground-truth song ID from the parent folder name, so the layout above must be
+preserved when extracting.
+
+How to obtain the dataset
+--------------------------
+MIR-QBSH is distributed through the MIREX community and the original authors
+at National Chengchi University (NCCU), Taiwan.
+
+Option 1 — Direct download (preferred if still hosted):
+    Homepage : http://mirlab.org/dataSet/public/
+    Direct   : http://mirlab.org/dataSet/public/MIR-QBSH.rar
+    Mirror   : https://github.com/mir-dataset-loaders/mir-dataset-loaders
+               (search for "mir_qbsh" loader)
+
+Option 2 — Via mirdata (pip install mirdata):
+    python -c "
+    import mirdata
+    dataset = mirdata.initialize('mir_qbsh')
+    dataset.download()
+    "
+    Then move the extracted folder into data/v2/eval/mir_qbsh/.
+
+Option 3 — Manual extraction:
+    1. Download the .rar or .zip archive from one of the sources above.
+    2. Extract it so that data/v2/eval/mir_qbsh/QBSHdata/ exists.
+    3. Run this script with --dry-run to verify the layout is correct.
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import sys
+from pathlib import Path
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
+log = logging.getLogger(__name__)
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+MIR_QBSH_DIR = REPO_ROOT / "data" / "v2" / "eval" / "mir_qbsh"
+HAND_RECORDED_DIR = REPO_ROOT / "data" / "v2" / "eval" / "hand_recorded"
+
+# Top-level sub-directories the MIR-QBSH archive creates after extraction.
+EXPECTED_SUBDIRS = ["QBSHdata"]
+
+
+def check_layout(root: Path) -> dict[str, bool]:
+    """Return a dict of expected sub-path → exists for the given root."""
+    return {subdir: (root / subdir).is_dir() for subdir in EXPECTED_SUBDIRS}
+
+
+def count_wav_files(root: Path) -> int:
+    return sum(1 for _ in root.rglob("*.wav"))
+
+
+def verify(dry_run: bool) -> int:
+    """
+    Verify that the MIR-QBSH dataset has been extracted correctly.
+
+    Returns 0 on success, 1 on failure.
+    """
+    log.info("Checking eval directory layout …")
+
+    if not MIR_QBSH_DIR.exists():
+        log.error("Directory not found: %s", MIR_QBSH_DIR)
+        log.error("Run `mkdir -p %s` and extract the dataset there.", MIR_QBSH_DIR)
+        return 1
+
+    layout = check_layout(MIR_QBSH_DIR)
+    missing = [name for name, present in layout.items() if not present]
+
+    if missing:
+        log.warning("MIR-QBSH directory exists but expected sub-directories are missing:")
+        for name in missing:
+            log.warning("  missing: %s/%s", MIR_QBSH_DIR, name)
+        log.warning("The dataset may not have been extracted yet.  See module docstring for instructions.")
+        if dry_run:
+            log.info("[dry-run] Skipping further checks.")
+            return 0
+        return 1
+
+    wav_count = count_wav_files(MIR_QBSH_DIR)
+    log.info("Found %d .wav file(s) under %s", wav_count, MIR_QBSH_DIR)
+
+    if wav_count == 0:
+        log.warning("No .wav files found.  Did extraction complete successfully?")
+        return 1
+
+    # MIR-QBSH should contain roughly 4000 queries across ~48 songs.
+    if wav_count < 100:
+        log.warning(
+            "Only %d .wav files found; MIR-QBSH should have ~4000. "
+            "The archive may be incomplete.",
+            wav_count,
+        )
+
+    log.info("Layout check passed.  MIR-QBSH appears correctly extracted.")
+    return 0
+
+
+def verify_hand_recorded() -> None:
+    if not HAND_RECORDED_DIR.exists():
+        log.warning("hand_recorded directory missing: %s", HAND_RECORDED_DIR)
+        return
+    wav_count = count_wav_files(HAND_RECORDED_DIR)
+    if wav_count == 0:
+        log.info(
+            "hand_recorded directory is empty.  "
+            "Record 100–200 phone-mic queries and place them here as: "
+            "data/v2/eval/hand_recorded/<song_id>/<query_id>.wav"
+        )
+    else:
+        log.info("hand_recorded: %d .wav file(s) found.", wav_count)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Verify Phase 0 eval directory layout.")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print checks without failing on missing files.",
+    )
+    args = parser.parse_args()
+
+    exit_code = verify(dry_run=args.dry_run)
+    verify_hand_recorded()
+
+    if exit_code == 0:
+        log.info("Setup check complete.  Run `python scripts/v2/eval.py` to evaluate.")
+    else:
+        log.error(
+            "Setup incomplete.  See the docstring at the top of this file for "
+            "download instructions, then re-run."
+        )
+
+    sys.exit(exit_code)
+
+
+if __name__ == "__main__":
+    main()
+"""Phase 1.2/1.3 — Resolve MSD IDs to Last.fm popularity scores.
+
+This script reads ``lmd_manifest.json``, looks up the artist + title for each
+MSD ID from a local metadata source, queries the Last.fm API for play counts,
+and writes ``popularity_scores.json`` with scores normalized to [0.0, 1.0].
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Quick-start
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. Get a free Last.fm API key
+   → https://www.last.fm/api/account/create  (takes ~30 seconds)
+
+2. Create ``.env`` in the project root::
+
+       LASTFM_API_KEY=your_32_char_key_here
+
+3. Download MSD track metadata (needed to map MSD ID → artist + title).
+
+   Option A — ``unique_tracks.txt`` (~74 MB compressed, recommended):
+       curl -O http://millionsongdataset.com/sites/default/files/AdditionalFiles/unique_tracks.txt
+       mv unique_tracks.txt data/v2/raw_midi/unique_tracks.txt
+       # Columns are delimited by the literal string <SEP>, not tabs or commas.
+
+   Option B — ``track_metadata.db`` SQLite (~1.9 GB, part of the full MSD):
+       # Download from http://millionsongdataset.com/pages/getting-dataset/
+       mv track_metadata.db data/v2/raw_midi/track_metadata.db
+
+4. Run::
+
+       python scripts/v2/fetch_popularity.py
+
+   The script checkpoints every 100 records to
+   ``data/v2/processed/popularity_checkpoint.db`` so you can safely Ctrl-C
+   and resume.  At ~3 req/s, 31 k songs takes roughly 3 hours.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Normalization
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Raw play counts span many orders of magnitude.  The script applies::
+
+    log_score = log(1 + playcount)
+
+then min-max normalises to [0.0, 1.0] over the corpus.  Songs not found on
+Last.fm receive the corpus-median score as a neutral prior, so they are not
+artificially ranked first or last.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Exit codes: 0 success · 1 internal error · 2 missing inputs
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import math
+import os
+import sqlite3
+import statistics
+import sys
+import traceback
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Iterator
+
+from tqdm import tqdm
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(_REPO_ROOT / "src"))
+
+from melody_matcher.data.lastfm_client import LastFmClient  # noqa: E402
+
+# ---------------------------------------------------------------------------
+# Defaults
+# ---------------------------------------------------------------------------
+_DEFAULT_MANIFEST = _REPO_ROOT / "data" / "v2" / "processed" / "lmd_manifest.json"
+_DEFAULT_CHECKPOINT = _REPO_ROOT / "data" / "v2" / "processed" / "popularity_checkpoint.db"
+_DEFAULT_OUT = _REPO_ROOT / "data" / "v2" / "processed" / "popularity_scores.json"
+_DEFAULT_UNIQUE_TRACKS = _REPO_ROOT / "data" / "v2" / "raw_midi" / "unique_tracks.txt"
+_DEFAULT_METADATA_DB = _REPO_ROOT / "data" / "v2" / "raw_midi" / "track_metadata.db"
+
+_CHECKPOINT_INTERVAL = 100  # flush to SQLite every N records
+
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+def _configure_logging(level: str) -> None:
+    logging.basicConfig(
+        level=level.upper(),
+        format="%(asctime)s  %(levelname)-8s  %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%S",
+    )
+
+
+# ---------------------------------------------------------------------------
+# MSD metadata loaders
+# ---------------------------------------------------------------------------
+
+def _load_metadata_from_unique_tracks(path: Path) -> dict[str, tuple[str, str]]:
+    """Parse ``unique_tracks.txt`` → {msd_id: (artist, title)}.
+
+    File format: ``<track_id><SEP><song_id><SEP><artist_name><SEP><title>``
+    The literal string ``<SEP>`` is used as the column delimiter.
+    """
+    meta: dict[str, tuple[str, str]] = {}
+    log = logging.getLogger(__name__)
+    log.info("Loading MSD metadata from %s …", path)
+    with path.open(encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            parts = line.rstrip("\n").split("<SEP>")
+            if len(parts) < 4:
+                continue
+            track_id, _, artist, title = parts[0], parts[1], parts[2], parts[3]
+            meta[track_id] = (artist.strip(), title.strip())
+    log.info("Loaded %d MSD track records.", len(meta))
+    return meta
+
+
+def _load_metadata_from_sqlite(path: Path) -> dict[str, tuple[str, str]]:
+    """Query ``track_metadata.db`` → {msd_id: (artist, title)}."""
+    log = logging.getLogger(__name__)
+    log.info("Loading MSD metadata from SQLite %s …", path)
+    meta: dict[str, tuple[str, str]] = {}
+    with sqlite3.connect(path) as con:
+        for row in con.execute("SELECT track_id, artist_name, title FROM songs"):
+            msd_id, artist, title = row
+            if msd_id and artist and title:
+                meta[str(msd_id)] = (str(artist).strip(), str(title).strip())
+    log.info("Loaded %d MSD track records.", len(meta))
+    return meta
+
+
+def _load_metadata_from_csv(path: Path) -> dict[str, tuple[str, str]]:
+    """Load a custom CSV with columns ``msd_id,artist,title`` (header row optional)."""
+    import csv
+    log = logging.getLogger(__name__)
+    log.info("Loading MSD metadata from CSV %s …", path)
+    meta: dict[str, tuple[str, str]] = {}
+    with path.open(encoding="utf-8", errors="replace", newline="") as fh:
+        reader = csv.reader(fh)
+        for row in reader:
+            if len(row) < 3:
+                continue
+            msd_id, artist, title = row[0].strip(), row[1].strip(), row[2].strip()
+            if msd_id.startswith("TR") and artist:
+                meta[msd_id] = (artist, title)
+    log.info("Loaded %d MSD track records from CSV.", len(meta))
+    return meta
+
+
+def _auto_load_metadata(
+    unique_tracks: Path,
+    metadata_db: Path,
+    metadata_csv: Path | None,
+) -> dict[str, tuple[str, str]]:
+    """Load metadata from whichever source is present, with priority order."""
+    if metadata_csv and metadata_csv.is_file():
+        return _load_metadata_from_csv(metadata_csv)
+    if unique_tracks.is_file():
+        return _load_metadata_from_unique_tracks(unique_tracks)
+    if metadata_db.is_file():
+        return _load_metadata_from_sqlite(metadata_db)
+    return {}
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint (SQLite)
+# ---------------------------------------------------------------------------
+
+def _open_checkpoint(path: Path) -> sqlite3.Connection:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(path, isolation_level=None)  # autocommit
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS results (
+            msd_id    TEXT PRIMARY KEY,
+            artist    TEXT,
+            title     TEXT,
+            playcount INTEGER,
+            listeners INTEGER,
+            status    TEXT,  -- 'found' | 'not_found' | 'no_metadata'
+            fetched_at REAL
+        )
+        """
+    )
+    return con
+
+
+def _already_done(con: sqlite3.Connection) -> set[str]:
+    rows = con.execute("SELECT msd_id FROM results").fetchall()
+    return {r[0] for r in rows}
+
+
+def _save_batch(con: sqlite3.Connection, batch: list[tuple]) -> None:
+    con.executemany(
+        """
+        INSERT OR REPLACE INTO results
+            (msd_id, artist, title, playcount, listeners, status, fetched_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        batch,
+    )
+
+
+def _load_checkpoint(con: sqlite3.Connection) -> dict[str, int]:
+    """Return {msd_id: playcount} for all 'found' records."""
+    rows = con.execute(
+        "SELECT msd_id, playcount FROM results WHERE status = 'found'"
+    ).fetchall()
+    return {r[0]: int(r[1]) for r in rows}
+
+
+# ---------------------------------------------------------------------------
+# Normalization
+# ---------------------------------------------------------------------------
+
+def _normalize_scores(
+    playcounts: dict[str, int],
+    all_msd_ids: list[str],
+) -> dict[str, float]:
+    """Log-normalize play counts to [0.0, 1.0]; assign median to missing IDs."""
+    if not playcounts:
+        return {msd_id: 0.5 for msd_id in all_msd_ids}
+
+    log_scores = {msd_id: math.log1p(pc) for msd_id, pc in playcounts.items()}
+    lo = min(log_scores.values())
+    hi = max(log_scores.values())
+    span = hi - lo
+
+    if span == 0:
+        normalized = {msd_id: 0.5 for msd_id in log_scores}
+    else:
+        normalized = {
+            msd_id: (ls - lo) / span for msd_id, ls in log_scores.items()
+        }
+
+    median = statistics.median(normalized.values())
+
+    return {
+        msd_id: normalized.get(msd_id, median)
+        for msd_id in all_msd_ids
+    }
+
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+
+def _parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Fetch Last.fm popularity scores for LMD-matched MSD IDs.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    p.add_argument("--manifest", type=Path, default=_DEFAULT_MANIFEST, metavar="FILE")
+    p.add_argument("--checkpoint", type=Path, default=_DEFAULT_CHECKPOINT, metavar="FILE",
+                   help="SQLite checkpoint file (default: %(default)s)")
+    p.add_argument("--out", type=Path, default=_DEFAULT_OUT, metavar="FILE",
+                   help="Output JSON path (default: %(default)s)")
+    p.add_argument("--unique-tracks", type=Path, default=_DEFAULT_UNIQUE_TRACKS, metavar="FILE",
+                   help="MSD unique_tracks.txt (default: %(default)s)")
+    p.add_argument("--metadata-db", type=Path, default=_DEFAULT_METADATA_DB, metavar="FILE",
+                   help="MSD track_metadata.db SQLite (default: %(default)s)")
+    p.add_argument("--metadata-csv", type=Path, default=None, metavar="FILE",
+                   help="Custom CSV with columns msd_id,artist,title")
+    p.add_argument("--calls-per-second", type=float, default=3.0, metavar="N",
+                   help="Last.fm request rate (default: 3.0)")
+    p.add_argument("--log-level", default="INFO",
+                   choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    return p.parse_args()
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def _run(args: argparse.Namespace) -> None:
+    log = logging.getLogger(__name__)
+
+    # --- Load manifest ---
+    if not args.manifest.is_file():
+        print(f"Manifest not found: {args.manifest}", file=sys.stderr)
+        print("Run scripts/v2/ingest_lakh.py first.", file=sys.stderr)
+        sys.exit(2)
+
+    with args.manifest.open(encoding="utf-8") as fh:
+        manifest: dict = json.load(fh)
+
+    all_msd_ids: list[str] = sorted(manifest["entries"].keys())
+    log.info("Manifest loaded: %d MSD IDs.", len(all_msd_ids))
+
+    # --- Load MSD metadata (artist + title) ---
+    metadata = _auto_load_metadata(
+        args.unique_tracks, args.metadata_db, args.metadata_csv
+    )
+    if not metadata:
+        print(
+            "\nNo MSD metadata found. Download unique_tracks.txt:\n"
+            "  curl -O http://millionsongdataset.com/sites/default/files/"
+            "AdditionalFiles/unique_tracks.txt\n"
+            "  mv unique_tracks.txt data/v2/raw_midi/unique_tracks.txt\n"
+            "Then re-run this script.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    # --- Open checkpoint ---
+    checkpoint_con = _open_checkpoint(args.checkpoint)
+    done = _already_done(checkpoint_con)
+    remaining = [msd_id for msd_id in all_msd_ids if msd_id not in done]
+    log.info(
+        "Checkpoint: %d done, %d remaining.", len(done), len(remaining)
+    )
+
+    # --- Fetch from Last.fm ---
+    batch: list[tuple] = []
+
+    with LastFmClient(calls_per_second=args.calls_per_second) as client:
+        with tqdm(
+            total=len(remaining),
+            desc="Fetching Last.fm",
+            unit="song",
+            dynamic_ncols=True,
+        ) as pbar:
+            for msd_id in remaining:
+                artist_title = metadata.get(msd_id)
+
+                if artist_title is None:
+                    batch.append(
+                        (msd_id, None, None, 0, 0, "no_metadata", _now())
+                    )
+                    pbar.update(1)
+                else:
+                    artist, title = artist_title
+                    result = client.get_track_info(artist, title)
+
+                    if result is not None:
+                        batch.append((
+                            msd_id, artist, title,
+                            result["playcount"], result["listeners"],
+                            "found", _now(),
+                        ))
+                    else:
+                        batch.append(
+                            (msd_id, artist, title, 0, 0, "not_found", _now())
+                        )
+                    pbar.update(1)
+
+                if len(batch) >= _CHECKPOINT_INTERVAL:
+                    _save_batch(checkpoint_con, batch)
+                    batch.clear()
+                    log.debug("Checkpoint flushed.")
+
+            # flush tail
+            if batch:
+                _save_batch(checkpoint_con, batch)
+
+    # --- Build final scores ---
+    playcounts = _load_checkpoint(checkpoint_con)
+    checkpoint_con.close()
+
+    found = len(playcounts)
+    not_found = len(all_msd_ids) - found
+    log.info("Last.fm results: %d found, %d not found / no metadata.", found, not_found)
+
+    scores = _normalize_scores(playcounts, all_msd_ids)
+
+    # --- Write output ---
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    tmp = args.out.with_name(args.out.name + ".tmp")
+    payload = {
+        "schema_version": "1.0",
+        "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "stats": {
+            "total_msd_ids": len(all_msd_ids),
+            "found_on_lastfm": found,
+            "not_found": not_found,
+            "median_score": statistics.median(scores.values()),
+        },
+        "scores": scores,
+    }
+    with tmp.open("w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2, ensure_ascii=False)
+        fh.write("\n")
+    os.replace(tmp, args.out)
+
+    log.info(
+        "Popularity scores written → %s  (%d IDs, %d found on Last.fm, %d not found)",
+        args.out, len(all_msd_ids), found, not_found,
+    )
+
+
+def _now() -> float:
+    import time
+    return time.time()
+
+
+def main() -> None:
+    args = _parse_args()
+    _configure_logging(args.log_level)
+    log = logging.getLogger(__name__)
+    try:
+        _run(args)
+    except SystemExit:
+        raise
+    except Exception:
+        log.error("Internal error:\n%s", traceback.format_exc())
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
+"""Phase 0.4 — Evaluation leaderboard script.
+
+Usage
+-----
+    source venv/bin/activate
+    python scripts/v2/eval.py [--dataset {mir_qbsh,hand_recorded}] [--k K] [--ranker dummy]
+
+This script is the single source of truth for offline evaluation.  Every
+retrieval model must be plugged in here and improve the numbers; a PR that
+drops MRR@10 by more than 2 points is blocked.
+
+How to add a real ranker
+------------------------
+1. Implement a callable with signature::
+
+       def my_ranker(query_audio_path: Path) -> list[str]:
+           ...  # return song IDs ordered by descending relevance
+
+2. Register it in ``_RANKERS`` at the bottom of this file.
+3. Pass ``--ranker my_ranker`` on the command line.
+
+Invariants
+----------
+* The eval sets in ``data/v2/eval/`` are FROZEN — never train on them.
+* This script must run to completion even when the dataset directory is empty
+  (it prints "0 queries evaluated" and exits cleanly with code 0).
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import random
+import sys
+import time
+from collections.abc import Callable
+from pathlib import Path
+from typing import Optional
+
+# ---------------------------------------------------------------------------
+# Path bootstrap — make the src package importable without `pip install -e .`
+# ---------------------------------------------------------------------------
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(_REPO_ROOT / "src"))
+
+from melody_matcher.eval.dataset_loader import EvalQuery, MIR_QBSH_Loader  # noqa: E402
+from melody_matcher.eval.metrics import compute_all  # noqa: E402
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
+log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Dataset roots
+# ---------------------------------------------------------------------------
+_EVAL_ROOT = _REPO_ROOT / "data" / "v2" / "eval"
+
+_DATASET_ROOTS: dict[str, Path] = {
+    "mir_qbsh": _EVAL_ROOT / "mir_qbsh",
+    "hand_recorded": _EVAL_ROOT / "hand_recorded",
+}
+
+# Fake song IDs used by the dummy ranker to simulate a corpus.
+_DUMMY_CORPUS: list[str] = [f"song_{i:04d}" for i in range(200)]
+
+
+# ---------------------------------------------------------------------------
+# Ranker implementations
+# ---------------------------------------------------------------------------
+
+
+def dummy_ranker(query_audio_path: Path) -> list[str]:  # noqa: ARG001
+    """Return a random top-10 ranking from the dummy corpus.
+
+    This ranker exists solely to let eval.py run end-to-end before any real
+    retrieval model is wired in.  Expected MRR@10 ≈ 0.005 (random baseline).
+    """
+    return random.sample(_DUMMY_CORPUS, k=10)
+
+
+# Map CLI name → callable.  Add real rankers here as they are implemented.
+_RANKERS: dict[str, Callable[[Path], list[str]]] = {
+    "dummy": dummy_ranker,
+}
+
+
+# ---------------------------------------------------------------------------
+# Dataset loading
+# ---------------------------------------------------------------------------
+
+
+def _load_queries(dataset: str) -> list[EvalQuery]:
+    """Load queries for the requested dataset.  Returns [] on empty dir."""
+    root = _DATASET_ROOTS.get(dataset)
+    if root is None:
+        log.error("Unknown dataset %r.  Choose from: %s", dataset, list(_DATASET_ROOTS))
+        sys.exit(1)
+
+    if dataset == "hand_recorded":
+        # hand_recorded uses the same two-level layout as MIR-QBSH.
+        loader = MIR_QBSH_Loader(root)
+    else:
+        loader = MIR_QBSH_Loader(root)
+
+    return loader.load_typed()
+
+
+# ---------------------------------------------------------------------------
+# Evaluation loop
+# ---------------------------------------------------------------------------
+
+
+def _run_eval(
+    queries: list[EvalQuery],
+    ranker: Callable[[Path], list[str]],
+    k: int,
+    popularity_scores: Optional[dict[str, float]],
+) -> tuple[dict[str, float], float]:
+    """Run the ranker over all queries and return (metrics_dict, elapsed_seconds)."""
+    ranked_lists: list[list[str]] = []
+    ground_truths: list[str] = []
+
+    t_start = time.perf_counter()
+    for query in queries:
+        results = ranker(query.query_audio_path)
+        ranked_lists.append(results)
+        ground_truths.append(query.ground_truth_song_id)
+    elapsed = time.perf_counter() - t_start
+
+    metrics = compute_all(ranked_lists, ground_truths, popularity_scores=popularity_scores)
+    return metrics, elapsed
+
+
+# ---------------------------------------------------------------------------
+# Report formatting
+# ---------------------------------------------------------------------------
+
+_COL_WIDTH = 28
+_VAL_WIDTH = 8
+_DIVIDER = "─" * (_COL_WIDTH + _VAL_WIDTH + 5)
+
+_METRIC_LABELS: dict[str, str] = {
+    "mrr@10": "MRR@10  (primary)",
+    "hit@1": "Hit@1",
+    "hit@5": "Hit@5",
+    "hit@10": "Hit@10",
+    "pop_weighted_hit@10": "Pop-weighted Hit@10",
+}
+
+_V1_TARGETS: dict[str, float] = {
+    "hit@1": 0.50,
+    "hit@10": 0.80,
+    "mrr@10": 0.0,   # no explicit MRR target in blueprint — shown for info
+}
+
+
+def _format_report(
+    ranker_name: str,
+    dataset: str,
+    n_queries: int,
+    metrics: dict[str, float],
+    elapsed: float,
+    k: int,
+) -> str:
+    lines: list[str] = []
+
+    lines.append("")
+    lines.append("╔" + "═" * (_COL_WIDTH + _VAL_WIDTH + 3) + "╗")
+    lines.append(f"║  Melody Matcher — Evaluation Leaderboard{' ' * (_COL_WIDTH + _VAL_WIDTH - 38)}║")
+    lines.append("╠" + "═" * (_COL_WIDTH + _VAL_WIDTH + 3) + "╣")
+
+    def row(label: str, value: str) -> str:
+        return f"║  {label:<{_COL_WIDTH}}{value:>{_VAL_WIDTH}}  ║"
+
+    lines.append(row("Dataset", dataset))
+    lines.append(row("Ranker", ranker_name))
+    lines.append(row("Queries evaluated", str(n_queries)))
+    lines.append(row("Rank cutoff (k)", str(k)))
+    lines.append(row("Total latency", f"{elapsed:.2f}s"))
+    if n_queries > 0:
+        lines.append(row("Avg latency / query", f"{elapsed / n_queries * 1000:.1f}ms"))
+
+    lines.append("╠" + "═" * (_COL_WIDTH + _VAL_WIDTH + 3) + "╣")
+    lines.append(f"║  {'Metric':<{_COL_WIDTH}}{'Score':>{_VAL_WIDTH}}  ║")
+    lines.append("╠" + "─" * (_COL_WIDTH + _VAL_WIDTH + 3) + "╣")
+
+    for key in ["mrr@10", "hit@1", "hit@5", "hit@10", "pop_weighted_hit@10"]:
+        if key not in metrics:
+            continue
+        label = _METRIC_LABELS.get(key, key)
+        score = metrics[key]
+        value_str = f"{score:.4f}"
+
+        target = _V1_TARGETS.get(key)
+        if target and score >= target:
+            flag = " ✓"
+        elif target and score > 0:
+            flag = " ·"
+        else:
+            flag = "  "
+
+        lines.append(f"║  {label:<{_COL_WIDTH}}{value_str:>{_VAL_WIDTH}}{flag}║")
+
+    lines.append("╠" + "─" * (_COL_WIDTH + _VAL_WIDTH + 3) + "╣")
+    lines.append(f"║  {'v1 targets: Hit@1≥0.50  Hit@10≥0.80':<{_COL_WIDTH + _VAL_WIDTH + 1}}  ║")
+    lines.append("╚" + "═" * (_COL_WIDTH + _VAL_WIDTH + 3) + "╝")
+    lines.append("")
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Melody Matcher offline evaluation leaderboard (Phase 0.4).",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--dataset",
+        choices=list(_DATASET_ROOTS),
+        default="mir_qbsh",
+        help="Eval set to run against (default: mir_qbsh).",
+    )
+    parser.add_argument(
+        "--ranker",
+        choices=list(_RANKERS),
+        default="dummy",
+        help="Ranker to evaluate (default: dummy).",
+    )
+    parser.add_argument(
+        "--k",
+        type=int,
+        default=10,
+        help="Rank cutoff for Hit@k display (default: 10).",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed for the dummy ranker (default: 42).",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = _parse_args()
+    random.seed(args.seed)
+
+    ranker = _RANKERS[args.ranker]
+    queries = _load_queries(args.dataset)
+
+    if not queries:
+        log.warning("No queries loaded — dataset may not be downloaded yet.")
+        log.warning("Run `python scripts/v2/setup_eval.py` for instructions.")
+        print(
+            _format_report(
+                ranker_name=args.ranker,
+                dataset=args.dataset,
+                n_queries=0,
+                metrics={},
+                elapsed=0.0,
+                k=args.k,
+            )
+        )
+        sys.exit(0)
+
+    log.info("Evaluating %d queries with ranker=%r …", len(queries), args.ranker)
+    metrics, elapsed = _run_eval(
+        queries=queries,
+        ranker=ranker,
+        k=args.k,
+        popularity_scores=None,  # wire in songs.parquet popularity once Phase 1 is done
+    )
+
+    print(
+        _format_report(
+            ranker_name=args.ranker,
+            dataset=args.dataset,
+            n_queries=len(queries),
+            metrics=metrics,
+            elapsed=elapsed,
+            k=args.k,
+        )
+    )
+
+
+if __name__ == "__main__":
+    main()
+"""Quick smoke-test CLI for MelodyExtractor.
+
+Usage
+-----
+    python scripts/v2/test_extractor.py --midi path/to/file.mid
+    python scripts/v2/test_extractor.py --midi path/to/file.mid --n 30 --log-level DEBUG
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import sys
+from pathlib import Path
+
+import pretty_midi
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(_REPO_ROOT / "src"))
+
+from melody_matcher.preprocessing.melody_extractor import (  # noqa: E402
+    MelodyExtractionError,
+    MelodyExtractor,
+    _NON_MELODY_PROGRAMS,
+)
+
+
+def _parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Inspect the melody extracted from a MIDI file.")
+    p.add_argument("--midi", required=True, type=Path, metavar="FILE")
+    p.add_argument("--n", type=int, default=20, metavar="N",
+                   help="Number of melody notes to print (default: 20)")
+    p.add_argument("--log-level", default="WARNING",
+                   choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    return p.parse_args()
+
+
+def _print_instrument_table(pm: pretty_midi.PrettyMIDI) -> None:
+    print(f"\n{'Tracks':=<60}")
+    print(f"  {'#':>2}  {'Prog':>4}  {'Drum':>4}  {'Notes':>5}  {'Filtered':>8}  Name")
+    print(f"  {'-'*2}  {'-'*4}  {'-'*4}  {'-'*5}  {'-'*8}  {'-'*20}")
+    for i, instr in enumerate(pm.instruments):
+        filtered = instr.is_drum or instr.program in _NON_MELODY_PROGRAMS
+        flag = "yes" if filtered else ""
+        print(
+            f"  {i:>2}  {instr.program:>4}  "
+            f"{'yes' if instr.is_drum else '':>4}  "
+            f"{len(instr.notes):>5}  "
+            f"{flag:>8}  "
+            f"{instr.name!r}"
+        )
+
+
+def main() -> None:
+    args = _parse_args()
+    logging.basicConfig(
+        level=args.log_level.upper(),
+        format="%(levelname)-8s %(name)s: %(message)s",
+    )
+
+    midi_path: Path = args.midi.resolve()
+    if not midi_path.is_file():
+        print(f"Error: file not found: {midi_path}", file=sys.stderr)
+        sys.exit(1)
+
+    # --- Load for inspection ---
+    try:
+        pm = pretty_midi.PrettyMIDI(str(midi_path))
+    except Exception as exc:
+        print(f"Error: pretty_midi could not load {midi_path}: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    tempo_changes = pm.get_tempo_changes()
+    tempos = tempo_changes[1]
+    avg_tempo = float(tempos.mean()) if len(tempos) else 0.0
+
+    print(f"\n{'File info':=<60}")
+    print(f"  Path       : {midi_path}")
+    print(f"  Resolution : {pm.resolution} ppq")
+    print(f"  Tempo      : {avg_tempo:.1f} BPM avg  ({len(tempos)} change(s))")
+    print(f"  End time   : {pm.get_end_time():.2f} s")
+    print(f"  Instruments: {len(pm.instruments)}")
+
+    _print_instrument_table(pm)
+
+    # --- Extract melody ---
+    extractor = MelodyExtractor()
+    try:
+        melody = extractor.extract(midi_path)
+    except MelodyExtractionError as exc:
+        print(f"\nExtraction failed: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"\n{'Melody':=<60}")
+    print(f"  Total notes extracted : {len(melody)}")
+
+    if not melody:
+        print("  (no notes — file may contain only drums or filtered instruments)")
+        return
+
+    show = melody[: args.n]
+    print(f"  Showing first {len(show)} of {len(melody)}:\n")
+    print(f"  {'#':>4}  {'Pitch':>5}  {'Name':<4}  {'Start (beat)':>12}  {'Dur (beats)':>11}")
+    print(f"  {'-'*4}  {'-'*5}  {'-'*4}  {'-'*12}  {'-'*11}")
+    for idx, note in enumerate(show, start=1):
+        name = pretty_midi.note_number_to_name(note.pitch)
+        print(
+            f"  {idx:>4}  {note.pitch:>5}  {name:<4}  "
+            f"{note.start_beat:>12.3f}  {note.duration_beats:>11.3f}"
+        )
+
+
+if __name__ == "__main__":
+    main()
